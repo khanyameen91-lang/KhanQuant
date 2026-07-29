@@ -51,6 +51,39 @@ def _append_journal(entry: dict):
     state_store.append_journal(entry)
 
 
+def _apply_close_to_daily_stats(pnl: float) -> None:
+    """Fold a closed trade's P&L into today's stats under a lock."""
+    def _mutate(stats):
+        stats["pnl"] = round(stats.get("pnl", 0.0) + pnl, 2)
+        stats["trade_count"] = stats.get("trade_count", 0) + 1
+        if pnl >= 0:
+            stats["winners"] = stats.get("winners", 0) + 1
+        else:
+            stats["losers"] = stats.get("losers", 0) + 1
+        return stats
+    state_store.update_daily_stats(_mutate)
+
+
+def _remove_position_from_state(position: dict) -> tuple:
+    """Drop a closed position from positions.json under a lock.
+    Returns (count_before, count_after)."""
+    counts = {"before": 0, "after": 0}
+
+    def _mutate(positions):
+        counts["before"] = len(positions)
+        target_id = position.get("order_id", position.get("id", ""))
+        remaining = [p for p in positions
+                     if p.get("order_id", p.get("id", str(id(p)))) != target_id]
+        # fallback: remove by symbol if id didn't match
+        if len(remaining) == counts["before"]:
+            remaining = [p for p in positions if p.get("symbol") != position.get("symbol")]
+        counts["after"] = len(remaining)
+        return remaining
+
+    state_store.update_positions(_mutate)
+    return counts["before"], counts["after"]
+
+
 # ── Risk Checks ────────────────────────────────────────────────────────────────
 def check_risk(setup: dict) -> tuple[bool, str]:
     """
@@ -228,9 +261,7 @@ def place_order(setup: dict, decision: dict) -> dict | None:
             "day_of_week":         now.weekday(),
             "ml_win_prob":         decision.get("ml_win_prob", 0),
         }
-        positions = _load_positions()
-        positions.append(position)
-        _save_positions(positions)
+        state_store.update_positions(lambda ps: ps + [position])
         alerts.trade_opened({
             "symbol": setup["symbol"],
             "strategy": f"[SANDBOX] {strategy_label}",
@@ -294,9 +325,7 @@ def place_order(setup: dict, decision: dict) -> dict | None:
         }
 
         # Save position
-        positions = _load_positions()
-        positions.append(position)
-        _save_positions(positions)
+        state_store.update_positions(lambda ps: ps + [position])
 
         # Send alert
         alerts.trade_opened({
@@ -393,25 +422,15 @@ def close_position(position: dict, reason: str = "Bot decision") -> bool:
     if is_sandbox:
         try:
             pnl = float(position.get("unrealized_pnl", 0.0))
-            # Update daily stats
-            stats = _load_daily_stats()
-            stats["pnl"] = round(stats.get("pnl", 0.0) + pnl, 2)
-            stats["trade_count"] = stats.get("trade_count", 0) + 1
-            if pnl >= 0:
-                stats["winners"] = stats.get("winners", 0) + 1
-            else:
-                stats["losers"] = stats.get("losers", 0) + 1
-            _save_daily_stats(stats)
-            # Remove from open positions
-            positions = _load_positions()
-            target_id = position.get("order_id", position.get("id", ""))
-            before = len(positions)
-            positions = [p for p in positions if p.get("order_id", p.get("id", str(id(p)))) != target_id]
-            # fallback: remove by symbol if id didn't match
-            if len(positions) == before:
-                positions = [p for p in positions if p.get("symbol") != position.get("symbol")]
-            _save_positions(positions)
-            _log(f"SANDBOX close OK: pnl=${pnl:.2f} positions_before={before} positions_after={len(positions)}")
+            # Update daily stats + remove from open positions. Both are
+            # read-modify-writes on files the dashboard process also
+            # writes (its manual close-position button calls right into
+            # this same function), so they go through the locked helpers
+            # rather than a bare load/save pair that could interleave and
+            # silently drop one process's update.
+            _apply_close_to_daily_stats(pnl)
+            before, after = _remove_position_from_state(position)
+            _log(f"SANDBOX close OK: pnl=${pnl:.2f} positions_before={before} positions_after={after}")
             try:
                 alerts.trade_closed(position, pnl)
             except Exception:
@@ -531,19 +550,11 @@ def close_position(position: dict, reason: str = "Bot decision") -> bool:
             # it was a scratch trade.
             _log(f"WARNING: could not determine final P&L for {position.get('symbol')} — recording as $0, needs manual reconciliation")
             pnl = 0.0
-        stats = _load_daily_stats()
-        stats["pnl"] = round(stats.get("pnl", 0.0) + pnl, 2)
-        stats["trade_count"] = stats.get("trade_count", 0) + 1
-        if pnl >= 0:
-            stats["winners"] = stats.get("winners", 0) + 1
-        else:
-            stats["losers"] = stats.get("losers", 0) + 1
-        _save_daily_stats(stats)
 
-        positions = _load_positions()
-        target_id = position.get("order_id", position.get("id", ""))
-        positions = [p for p in positions if p.get("order_id", p.get("id", str(id(p)))) != target_id]
-        _save_positions(positions)
+        # Both are read-modify-writes on files the dashboard process also
+        # writes — see the sandbox close path above for the full rationale.
+        _apply_close_to_daily_stats(pnl)
+        _remove_position_from_state(position)
 
         try:
             alerts.trade_closed(position, pnl)
@@ -731,11 +742,23 @@ def _get_option_mid(chain, opt_type: str, strike: float) -> float:
     return last
 
 
+def _position_key(pos: dict) -> str:
+    """Stable identity for matching a position across a reload."""
+    return str(pos.get("order_id") or pos.get("id") or pos.get("symbol", ""))
+
+
 def refresh_position_prices():
     """
     Fetch current market prices for all open positions via yfinance
     and update positions.json with live P&L data.
     Handles single-leg options and two-leg spreads.
+
+    Prices are fetched into a side dict first and only merged back into
+    positions.json at the end under a lock, re-reading the file fresh.
+    Fetching takes seconds (network-bound, one chain per position), and
+    writing back a list captured before all that would resurrect any
+    position closed in the meantime — by the bot's own exit check or by
+    the dashboard's manual close button running in a separate process.
     """
     positions = _load_positions()
     if not positions:
@@ -746,7 +769,7 @@ def refresh_position_prices():
     except ImportError:
         return
 
-    updated = False
+    price_updates = {}   # position_key -> dict of fields to merge back
     for pos in positions:
         try:
             setup      = pos.get("setup", {})
@@ -795,11 +818,12 @@ def refresh_position_prices():
                     max_profit = float(setup.get("max_profit") or pos.get("max_profit") or 1)
                     pnl_pct = round(unrealized_pnl / max_profit * 100, 1)
 
-                pos["unrealized_pnl"]   = unrealized_pnl
-                pos["pnl_pct"]          = pnl_pct
-                pos["price_updated_at"] = datetime.now().isoformat()
-                pos["price_stale"] = False
-                updated = True
+                price_updates[_position_key(pos)] = {
+                    "unrealized_pnl":   unrealized_pnl,
+                    "pnl_pct":          pnl_pct,
+                    "price_updated_at": datetime.now().isoformat(),
+                    "price_stale":      False,
+                }
 
             # ── Single-leg options ────────────────────────────────────────────
             else:
@@ -818,19 +842,29 @@ def refresh_position_prices():
                 unrealized_pnl = round((current_price - entry_price) * 100, 2)
                 pnl_pct = round((current_price - entry_price) / entry_price * 100, 1)
 
-                pos["current_price"]    = round(current_price, 2)
-                pos["entry_price"]      = round(entry_price, 2)
-                pos["unrealized_pnl"]   = unrealized_pnl
-                pos["pnl_pct"]          = pnl_pct
-                pos["price_updated_at"] = datetime.now().isoformat()
-                pos["price_stale"] = False
-                updated = True
+                price_updates[_position_key(pos)] = {
+                    "current_price":    round(current_price, 2),
+                    "entry_price":      round(entry_price, 2),
+                    "unrealized_pnl":   unrealized_pnl,
+                    "pnl_pct":          pnl_pct,
+                    "price_updated_at": datetime.now().isoformat(),
+                    "price_stale":      False,
+                }
 
         except Exception as e:
             print(f"  Price refresh error {pos.get('symbol', '?')}: {e}")
 
-    if updated:
-        _save_positions(positions)
+    if not price_updates:
+        return
+
+    def _merge(current_positions):
+        for p in current_positions:
+            fields = price_updates.get(_position_key(p))
+            if fields:
+                p.update(fields)
+        return current_positions
+
+    state_store.update_positions(_merge)
 
 
 def get_open_positions() -> list:

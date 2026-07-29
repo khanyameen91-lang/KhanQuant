@@ -31,12 +31,22 @@ try:
 except ImportError:
     YF_AVAILABLE = False
 
+# Sentiment scoring reuses claude_brain's provider chain (Groq first, then
+# Anthropic, then unavailable) rather than constructing its own Anthropic
+# client. It used to do the latter with api_key=os.environ.get(
+# "ANTHROPIC_API_KEY", "") — an empty string still constructs successfully,
+# so CLAUDE_AVAILABLE was True while every actual call failed with an auth
+# error, and the failure was swallowed into a silent neutral 50. Sentiment
+# is 12% of composite confidence, so that meant an eighth of every trade
+# decision was a constant. Groq is already configured and free.
 try:
-    import anthropic
-    _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-    CLAUDE_AVAILABLE = True
+    import claude_brain
+    LLM_AVAILABLE = claude_brain._llm_provider in ("groq", "anthropic")
 except Exception:
-    CLAUDE_AVAILABLE = False
+    LLM_AVAILABLE = False
+
+# Back-compat alias — other modules/tests may still reference this name.
+CLAUDE_AVAILABLE = LLM_AVAILABLE
 
 SENTIMENT_CACHE_FILE = Path("logs/sentiment_cache.json")
 CACHE_TTL = 1800  # 30 minutes — news doesn't change that fast
@@ -169,10 +179,11 @@ def _get_economic_events_today() -> list:
 
 def _score_sentiment_with_claude(headlines: list, symbol: str) -> dict:
     """
-    Use Claude to score market sentiment from news headlines.
+    Score market sentiment from news headlines via the configured LLM
+    provider (Groq by default — see claude_brain).
     Returns score 0-100 and brief analysis.
     """
-    if not CLAUDE_AVAILABLE or not headlines:
+    if not LLM_AVAILABLE or not headlines:
         return {"score": 50, "sentiment": "NEUTRAL", "summary": "No news data"}
 
     # Check cache
@@ -203,12 +214,12 @@ Respond with ONLY valid JSON:
 {{"score": 0-100, "sentiment": "BULLISH/BEARISH/NEUTRAL", "key_theme": "one sentence summary", "risk_flags": ["any specific risks"]}}"""
 
     try:
-        response = _client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        raw = claude_brain._call_llm(
+            prompt,
+            system="You are a financial news sentiment analyst. Respond with only valid JSON.",
             max_tokens=512,
-            messages=[{"role": "user", "content": prompt}]
         )
-        raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         # Extract first JSON object only (guard against extra text after closing brace)
         brace = raw.find("{")
         if brace != -1:

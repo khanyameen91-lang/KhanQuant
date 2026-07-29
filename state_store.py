@@ -20,7 +20,9 @@ This module centralizes that state in one place with two changes:
 
 import os
 import json
+import time
 import logging
+import contextlib
 from datetime import date, datetime
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -34,6 +36,22 @@ RISK_STATE_FILE       = LOG_DIR / "risk_state.json"
 WEEKLY_STATS_FILE     = LOG_DIR / "weekly_stats.json"
 PROTECTION_STATE_FILE = LOG_DIR / "profit_protection_state.json"
 
+# Cross-process advisory locking, stdlib only (no filelock dependency —
+# the server doesn't have it installed and this doesn't warrant one).
+# fcntl on POSIX (the Ubuntu server, which is what actually matters for
+# production), msvcrt on Windows (dev machine).
+try:
+    import fcntl
+    _LOCK_IMPL = "fcntl"
+except ImportError:
+    fcntl = None
+    try:
+        import msvcrt
+        _LOCK_IMPL = "msvcrt"
+    except ImportError:
+        msvcrt = None
+        _LOCK_IMPL = None
+
 
 def daily_stats_file(for_date: date = None) -> Path:
     d = for_date or date.today()
@@ -45,13 +63,75 @@ def monthly_stats_file(for_date: date = None) -> Path:
     return LOG_DIR / f"monthly_{d.strftime('%Y_%m')}.json"
 
 
+@contextlib.contextmanager
+def file_lock(name: str, timeout: float = 10.0):
+    """
+    Cross-process advisory lock, held for the duration of the `with` block.
+
+    bot.py (scan loop) and dashboard.py (manual close-position button) are
+    separate processes that both read-modify-write the same positions.json
+    and stats files. Without a lock, a manual close racing an automated
+    exit can lose one of the two updates entirely — classic read-modify-
+    write race, and the losing update is silently gone.
+
+    Best-effort by design: if the platform has no lock primitive, or the
+    lock can't be acquired within `timeout`, this logs and proceeds rather
+    than blocking trading indefinitely. A missed lock is a small
+    correctness risk; a hung trading bot is a bigger one.
+    """
+    LOG_DIR.mkdir(exist_ok=True)
+    lock_path = LOG_DIR / f".{name}.lock"
+
+    if _LOCK_IMPL is None:
+        yield
+        return
+
+    fh = open(lock_path, "a+b")
+    acquired = False
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            try:
+                if _LOCK_IMPL == "fcntl":
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except (OSError, IOError):
+                time.sleep(0.05)
+
+        if not acquired:
+            log.warning(f"state_store: couldn't acquire {name} lock within {timeout}s — proceeding unlocked")
+        yield
+    finally:
+        if acquired:
+            try:
+                if _LOCK_IMPL == "fcntl":
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                else:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+        fh.close()
+
+
 def atomic_write_json(path: Path, data) -> None:
     """Write JSON atomically: write to a sibling temp file, then os.replace()
     it over the target. os.replace is atomic on both POSIX and Windows when
     source and destination are on the same volume, so a crash mid-write
-    leaves either the old file or the new one, never a truncated hybrid."""
+    leaves either the old file or the new one, never a truncated hybrid.
+
+    Note: atomicity protects against a *torn* file, not against a lost
+    update between two processes that each read-then-wrote. Use
+    file_lock() around a read-modify-write sequence for that.
+    """
     LOG_DIR.mkdir(exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Unique temp name per process so two concurrent writers can't clobber
+    # each other's temp file mid-write and produce a corrupt result.
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
 
@@ -101,6 +181,30 @@ def save_positions(positions: list) -> None:
     atomic_write_json(POSITIONS_FILE, positions)
 
 
+def update_positions(mutator):
+    """
+    Read-modify-write positions.json under a cross-process lock.
+
+    `mutator` takes the current positions list and returns the new one
+    (or None to abort the write). Use this instead of a bare
+    load_positions() ... save_positions() pair anywhere the new value
+    depends on the old one — otherwise bot.py's scan loop and
+    dashboard.py's manual close can interleave and silently drop one of
+    the two updates.
+
+    Returns whatever the mutator returned.
+    """
+    with file_lock("positions"):
+        positions, ok = load_positions_checked()
+        if not ok:
+            log.error("state_store: refusing to modify unreadable positions.json")
+            return None
+        updated = mutator(positions)
+        if updated is not None:
+            atomic_write_json(POSITIONS_FILE, updated)
+        return updated
+
+
 # ── Trade journal ────────────────────────────────────────────────────────────
 
 def load_journal() -> list:
@@ -111,9 +215,10 @@ def load_journal() -> list:
 
 
 def append_journal(entry: dict, keep: int = 500) -> None:
-    journal = load_journal()
-    journal.insert(0, entry)
-    atomic_write_json(JOURNAL_FILE, journal[:keep])
+    with file_lock("journal"):
+        journal = load_journal()
+        journal.insert(0, entry)
+        atomic_write_json(JOURNAL_FILE, journal[:keep])
 
 
 # ── Daily stats ──────────────────────────────────────────────────────────────
@@ -142,6 +247,28 @@ def load_daily_stats() -> dict:
 
 def save_daily_stats(stats: dict) -> None:
     atomic_write_json(daily_stats_file(), stats)
+
+
+def update_daily_stats(mutator):
+    """
+    Read-modify-write today's stats file under a cross-process lock. Same
+    rationale as update_positions() — accumulating P&L and incrementing
+    trade/win/loss counters is a read-modify-write, so two processes
+    closing positions at the same moment could otherwise lose one trade's
+    P&L from the daily total entirely.
+
+    Refuses to write if the existing file is corrupted (fails closed
+    rather than overwriting an unreadable day with a fresh-looking one).
+    """
+    with file_lock("daily_stats"):
+        stats = load_daily_stats()
+        if stats.get("_corrupted"):
+            log.error("state_store: refusing to modify unreadable daily stats file")
+            return None
+        updated = mutator(stats)
+        if updated is not None:
+            atomic_write_json(daily_stats_file(), updated)
+        return updated
 
 
 # ── Risk state ───────────────────────────────────────────────────────────────
