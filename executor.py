@@ -720,15 +720,20 @@ def _close_position_inner(position: dict, reason: str = "Bot decision") -> bool:
             "max_profit": position.get("max_profit", 0), "close_reason": reason,
             "reasoning": position.get("reasoning", ""),
             "confidence": position.get("confidence", 0),
-            "technical_score": position.get("technical_score", 50),
-            "flow_score": position.get("flow_score", 50),
-            "sentiment_score": position.get("sentiment_score", 50),
-            "volatility_score": position.get("volatility_score", 50),
-            "regime_score": position.get("regime_score", 50),
-            "institutional_score": position.get("institutional_score", 50),
-            "ev_score": position.get("ev_score", 50),
-            "liquidity_score": position.get("liquidity_score", 50),
-            "rs_score": position.get("rs_score", 50),
+            # Sub-scores are recorded as null when genuinely unavailable
+            # rather than defaulted to 50 — the ML feature extractor
+            # encodes that distinction (see ml_engine._SCORE_KEYS), so a
+            # subsystem that was down doesn't train the model as though
+            # it had returned a real neutral reading.
+            "technical_score": position.get("technical_score"),
+            "flow_score": position.get("flow_score"),
+            "sentiment_score": position.get("sentiment_score"),
+            "volatility_score": position.get("volatility_score"),
+            "regime_score": position.get("regime_score"),
+            "institutional_score": position.get("institutional_score"),
+            "ev_score": position.get("ev_score"),
+            "liquidity_score": position.get("liquidity_score"),
+            "rs_score": position.get("rs_score"),
             "regime_type": position.get("regime_type", "unknown"),
             "iv_rank": position.get("iv_rank", 50), "dte": position.get("dte", 14),
             "ml_win_prob": position.get("ml_win_prob", 0),

@@ -37,11 +37,19 @@ try:
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+    from sklearn.calibration import CalibratedClassifierCV
     import pickle
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
     print("Warning: scikit-learn not installed. ML features limited.")
+
+# Sub-scores that get a companion "was this actually measured?" flag in
+# the feature vector (see _extract_features).
+_SCORE_KEYS = [
+    "technical_score", "flow_score", "sentiment_score", "volatility_score",
+    "regime_score", "institutional_score", "ev_score", "liquidity_score", "rs_score",
+]
 
 # Regime types for one-hot encoding
 _REGIME_TYPES = [
@@ -242,37 +250,57 @@ def _extract_features(trade: dict) -> list:
     regime = (trade.get("regime_type") or "unknown").lower().replace(" ", "_")
     regime_onehot = [1.0 if r == regime else 0.0 for r in _REGIME_TYPES]
 
+    # Sub-score features carry a companion "was this actually measured"
+    # flag (see _SCORE_KEYS / missingness features below). Every score
+    # defaults to 50 when absent, which is indistinguishable from a
+    # genuinely neutral reading — so a subsystem that silently degrades
+    # (a dead API key, a rate-limited LLM) feeds the model a constant it
+    # reads as real signal. The flags let the model learn "this row's
+    # sentiment was unavailable" instead of "sentiment was exactly 50."
+    missing_flags = [0.0 if trade.get(k) is None else 1.0 for k in _SCORE_KEYS]
+
+    def _num(key, default):
+        # dict.get(key, default) returns None when the key EXISTS with a
+        # None value, which is exactly the "measurement unavailable" case
+        # the flags above encode — so substitute the default explicitly.
+        v = trade.get(key)
+        return float(default if v is None else v)
+
     base_features = [
-        float(trade.get("confidence", 50)),
-        float(trade.get("technical_score", 50)),
-        float(trade.get("flow_score", 50)),
-        float(trade.get("sentiment_score", 50)),
-        float(trade.get("volatility_score", 50)),
-        float(trade.get("regime_score", 50)),
-        float(trade.get("institutional_score", 50)),
+        _num("confidence", 50),
+        _num("technical_score", 50),
+        _num("flow_score", 50),
+        _num("sentiment_score", 50),
+        _num("volatility_score", 50),
+        _num("regime_score", 50),
+        _num("institutional_score", 50),
         # Phase 1 new scores
-        float(trade.get("ev_score", 50)),
-        float(trade.get("liquidity_score", 50)),
-        float(trade.get("rs_score", 50)),
+        _num("ev_score", 50),
+        _num("liquidity_score", 50),
+        _num("rs_score", 50),
         # Trade params
-        float(trade.get("iv_rank", 50)),
-        float(trade.get("dte", 14)),
+        _num("iv_rank", 50),
+        _num("dte", 14),
         1.0 if trade.get("direction") == "bullish" else (
             0.0 if trade.get("direction") == "bearish" else 0.5
         ),
-        float(trade.get("max_loss", 100)),
+        _num("max_loss", 100),
         # Time features
-        float(trade.get("hour_of_day", 10)),   # 9-16 EST
+        _num("hour_of_day", 10),   # 9-16 EST
         1.0 if trade.get("day_of_week", 2) in (0, 4) else 0.0,  # Mon/Fri flag
     ]
-    return base_features + regime_onehot
+    return base_features + regime_onehot + missing_flags
 
 
-_FEATURE_NAMES = [
-    "confidence", "technical", "flow", "sentiment", "volatility",
-    "regime_score", "institutional", "ev_score", "liquidity_score", "rs_score",
-    "iv_rank", "dte", "direction", "max_loss", "hour_of_day", "mon_fri_flag",
-] + [f"regime_{r}" for r in _REGIME_TYPES]
+_FEATURE_NAMES = (
+    [
+        "confidence", "technical", "flow", "sentiment", "volatility",
+        "regime_score", "institutional", "ev_score", "liquidity_score", "rs_score",
+        "iv_rank", "dte", "direction", "max_loss", "hour_of_day", "mon_fri_flag",
+    ]
+    + [f"regime_{r}" for r in _REGIME_TYPES]
+    + [f"has_{k}" for k in _SCORE_KEYS]
+)
 
 
 def train_model(trades: list) -> dict:
@@ -297,53 +325,90 @@ def train_model(trades: list) -> dict:
     X = np.array([_extract_features(t) for t in scored_trades])
     y = np.array([1 if t.get("pnl", 0) > 0 else 0 for t in scored_trades])
 
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Train RandomForest
-    model = RandomForestClassifier(
+    # Hyperparameters used for BOTH the CV estimate and the production
+    # model. These used to differ (CV ran n_estimators=100/max_depth=5/
+    # min_samples_leaf=3 while the saved model used 200/6/5), so the
+    # "walk-forward accuracy" reported on the dashboard described an
+    # estimator that never made a live prediction.
+    model_params = dict(
         n_estimators=200,
         max_depth=6,
         min_samples_leaf=5,
         random_state=42,
         class_weight="balanced",
-        n_jobs=-1,
     )
 
     # Walk-forward cross-validation (respects temporal order — no lookahead bias)
     wf_cv_acc = 0.0
     wf_details = []
+    baseline_acc = float(max(np.mean(y), 1 - np.mean(y)))  # majority-class rate
     n_splits = min(5, len(scored_trades) // 20)  # at least 20 trades per fold
     if n_splits >= 2:
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_accs = []
-        for fold, (train_idx, test_idx) in enumerate(tscv.split(X_scaled)):
-            X_tr, X_te = X_scaled[train_idx], X_scaled[test_idx]
+        for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+            X_tr, X_te = X[train_idx], X[test_idx]
             y_tr, y_te = y[train_idx], y[test_idx]
             if len(np.unique(y_tr)) < 2:
                 continue
-            m = RandomForestClassifier(n_estimators=100, max_depth=5,
-                                       min_samples_leaf=3, random_state=42,
-                                       class_weight="balanced")
-            m.fit(X_tr, y_tr)
-            acc = float(m.score(X_te, y_te))
+            # Fit the scaler inside the fold on TRAINING data only. It
+            # used to be fit once on the full dataset before splitting,
+            # which leaks test-fold statistics into every fold and makes
+            # the CV score optimistic (and not a true walk-forward).
+            fold_scaler = StandardScaler()
+            X_tr_s = fold_scaler.fit_transform(X_tr)
+            X_te_s = fold_scaler.transform(X_te)
+            m = RandomForestClassifier(n_jobs=-1, **model_params)
+            m.fit(X_tr_s, y_tr)
+            acc = float(m.score(X_te_s, y_te))
             fold_accs.append(acc)
             wf_details.append({"fold": fold + 1, "train_n": len(train_idx),
                                 "test_n": len(test_idx), "accuracy": round(acc * 100, 1)})
         wf_cv_acc = float(np.mean(fold_accs)) if fold_accs else 0.0
 
-    model.fit(X_scaled, y)
+    # Production model: same hyperparameters as the CV above, fit on all
+    # data, with probability calibration so predict_proba() means what
+    # bot.py's `ml_prob < 0.35` gate assumes it means. A raw
+    # class_weight="balanced" RandomForest produces uncalibrated scores —
+    # treating them as real probabilities in a hard threshold is exactly
+    # the mistake that gate was making.
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    base_model = RandomForestClassifier(n_jobs=-1, **model_params)
 
-    # Feature importances (top 10)
-    importances = {name: round(float(imp), 4)
-                   for name, imp in zip(_FEATURE_NAMES, model.feature_importances_)}
-    top_features = dict(sorted(importances.items(), key=lambda x: -x[1])[:10])
+    calibrated = False
+    if len(scored_trades) >= 100 and len(np.unique(y)) == 2:
+        try:
+            model = CalibratedClassifierCV(base_model, method="isotonic", cv=3)
+            model.fit(X_scaled, y)
+            calibrated = True
+        except Exception as e:
+            print(f"ML: calibration failed ({e}) — using uncalibrated model")
+            model = base_model
+            model.fit(X_scaled, y)
+    else:
+        # Not enough data for a trustworthy calibration split yet.
+        model = base_model
+        model.fit(X_scaled, y)
 
-    # Log top features
-    print("ML: Top predictive features:")
-    for fname, fimp in top_features.items():
-        print(f"     {fname}: {fimp:.4f}")
+    # Feature importances (top 10). A CalibratedClassifierCV wraps the
+    # forest rather than exposing importances directly, so pull them from
+    # a plain forest fit on the same data for reporting purposes.
+    try:
+        if calibrated:
+            importance_src = RandomForestClassifier(n_jobs=-1, **model_params)
+            importance_src.fit(X_scaled, y)
+        else:
+            importance_src = model
+        importances = {name: round(float(imp), 4)
+                       for name, imp in zip(_FEATURE_NAMES, importance_src.feature_importances_)}
+        top_features = dict(sorted(importances.items(), key=lambda x: -x[1])[:10])
+        print("ML: Top predictive features:")
+        for fname, fimp in top_features.items():
+            print(f"     {fname}: {fimp:.4f}")
+    except Exception as e:
+        print(f"ML: could not compute feature importances: {e}")
+        top_features = {}
 
     # Save model + scaler
     try:
@@ -353,10 +418,23 @@ def train_model(trades: list) -> dict:
     except Exception as e:
         print(f"Warning: Could not save ML model: {e}")
 
+    # An accuracy number means nothing without the baseline it has to
+    # beat: with a 65% win rate, a model that blindly predicts "win"
+    # every time scores 65%. beats_baseline is the number that actually
+    # tells you whether the model is learning anything.
+    edge_vs_baseline = round((wf_cv_acc - baseline_acc) * 100, 1)
+    if wf_cv_acc and edge_vs_baseline <= 0:
+        print(f"ML: WARNING — CV accuracy {wf_cv_acc*100:.1f}% does not beat the "
+              f"majority-class baseline {baseline_acc*100:.1f}%")
+
     return {
         "status":              "trained",
         "trades_used":         len(scored_trades),
         "walk_forward_cv_acc": round(wf_cv_acc * 100, 1),
+        "baseline_acc":        round(baseline_acc * 100, 1),
+        "edge_vs_baseline":    edge_vs_baseline,
+        "beats_baseline":      bool(wf_cv_acc > baseline_acc),
+        "calibrated":          calibrated,
         "wf_fold_details":     wf_details,
         "feature_importance":  top_features,
         "win_rate_actual":     round(float(y.mean()) * 100, 1),
@@ -377,6 +455,18 @@ def predict_win_probability(trade_features: dict) -> float:
             bundle = pickle.load(f)
         model  = bundle["model"]
         scaler = bundle["scaler"]
+
+        # A model pickled before the feature set changed expects a
+        # different vector width. Rather than raising (and being caught
+        # into a silent 0.5 that looks like a real "coin flip" verdict),
+        # detect the mismatch explicitly and report it — the next nightly
+        # retrain regenerates the model against the current features.
+        saved_names = bundle.get("feature_names") or []
+        if saved_names and len(saved_names) != len(_FEATURE_NAMES):
+            print(f"ML: saved model expects {len(saved_names)} features but current "
+                  f"feature set has {len(_FEATURE_NAMES)} — model is stale, "
+                  f"skipping prediction until next retrain")
+            return 0.5
 
         X = np.array([_extract_features(trade_features)])
         X_scaled = scaler.transform(X)
