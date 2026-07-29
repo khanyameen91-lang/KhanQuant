@@ -290,6 +290,23 @@ def place_order(setup: dict, decision: dict) -> dict | None:
 
         print(f"✅ Order placed! ID: {order_id}")
 
+        # An accepted order ID is NOT a fill. This used to record the
+        # position as open the instant the broker returned an ID, so a
+        # limit order that was accepted but never filled (price moved
+        # away, or it sat and expired) would be tracked locally as a real
+        # position that doesn't exist at the broker — with exit checks
+        # and stop-losses running against it forever.
+        fill_status = _await_fill(account_number, order_id)
+        if fill_status != "Filled":
+            print(f"⚠️  Order {order_id} did not fill (status: {fill_status}) — not recording a position")
+            alerts.degraded(
+                "order_unfilled",
+                f"{setup['symbol']} {strategy_label} order {order_id} ended as "
+                f"'{fill_status}' rather than Filled — no position recorded",
+                cooldown_minutes=5,
+            )
+            return None
+
         # Build position record
         now = datetime.now()
         position = {
@@ -347,6 +364,100 @@ def place_order(setup: dict, decision: dict) -> dict | None:
         return None
 
 
+def get_order_status(account_number: str, order_id: str):
+    """Current broker-side status for an order, or None if unreadable."""
+    try:
+        resp = session.get(f"/accounts/{account_number}/orders/{order_id}")
+        return resp.get("data", {}).get("status")
+    except Exception as e:
+        print(f"⚠️  Order status fetch error for {order_id}: {e}")
+        return None
+
+
+# Terminal states — no point polling further once an order reaches one.
+_ORDER_DONE_STATES = {"Filled", "Cancelled", "Rejected", "Expired", "Removed"}
+
+
+def _await_fill(account_number: str, order_id: str,
+                timeout_sec: float = 45.0, poll_sec: float = 3.0) -> str:
+    """
+    Poll an order until it fills, reaches another terminal state, or the
+    timeout expires. Returns the final status string ("Filled",
+    "Rejected", "Live" if still working when we give up, etc.).
+
+    A limit order that's still 'Live' at timeout isn't an error — it just
+    hasn't filled yet, and the caller should not record it as an open
+    position. It stays working at the broker and will be picked up by
+    reconcile_with_broker() on a later cycle if it does fill.
+    """
+    deadline = time.time() + timeout_sec
+    status = None
+    while time.time() < deadline:
+        status = get_order_status(account_number, order_id)
+        if status in _ORDER_DONE_STATES:
+            return status
+        time.sleep(poll_sec)
+    return status or "Unknown"
+
+
+def reconcile_with_broker() -> dict:
+    """
+    Compare locally-tracked positions against what the broker actually
+    reports, and alert on any mismatch.
+
+    Nothing anywhere used to do this. A local file that's lost or
+    corrupted, a manual trade placed outside the bot, an order that was
+    accepted but never filled, or a position closed at the broker by
+    something other than the bot would all drift silently — the bot would
+    keep managing a position that isn't there, or ignore one that is.
+
+    Read-only and advisory: it reports, it doesn't auto-mutate local
+    state. Auto-"fixing" a mismatch is exactly the kind of destructive
+    guess that should stay a human decision.
+
+    Skipped entirely in sandbox mode, where local state IS the source of
+    truth by design (no real broker positions exist to compare against).
+    """
+    if os.environ.get("TRADING_MODE", "sandbox").lower() == "sandbox":
+        return {"skipped": "sandbox mode"}
+
+    try:
+        account_number = session.account_number
+        resp = session.get(f"/accounts/{account_number}/positions")
+        broker_items = resp.get("data", {}).get("items", [])
+    except Exception as e:
+        alerts.degraded("reconcile", f"Couldn't fetch broker positions: {e}", cooldown_minutes=60)
+        return {"error": str(e)}
+
+    broker_symbols = {p.get("symbol") for p in broker_items if p.get("symbol")}
+    local_positions = _load_positions()
+    local_symbols = {p.get("symbol") for p in local_positions if p.get("symbol")}
+
+    only_local = local_symbols - broker_symbols
+    only_broker = broker_symbols - local_symbols
+
+    if only_local:
+        alerts.risk_warning(
+            f"⚠️ Reconciliation: {len(only_local)} position(s) tracked locally but "
+            f"NOT open at the broker: {', '.join(sorted(only_local))}. "
+            f"Likely an unfilled order or a fill the bot missed — needs review."
+        )
+    if only_broker:
+        alerts.risk_warning(
+            f"⚠️ Reconciliation: {len(only_broker)} position(s) open at the broker but "
+            f"NOT tracked by the bot: {', '.join(sorted(only_broker))}. "
+            f"These are unmanaged — no stop-loss or exit logic is running on them."
+        )
+
+    return {
+        "local_count": len(local_symbols),
+        "broker_count": len(broker_symbols),
+        "only_local": sorted(only_local),
+        "only_broker": sorted(only_broker),
+        "in_sync": not only_local and not only_broker,
+    }
+
+
 # ── Position Monitoring ────────────────────────────────────────────────────────
 def get_position_pnl(position: dict):
     """
@@ -389,7 +500,36 @@ def get_position_pnl(position: dict):
 def close_position(position: dict, reason: str = "Bot decision") -> bool:
     """
     Close an open position by placing a closing order.
+
+    Thin wrapper around _close_position_inner() that enforces the
+    duplicate-close guard. A close request that succeeded at the broker
+    but whose HTTP response was lost (timeout) would raise inside, leaving
+    the position in local state — and the next 2-minute scan cycle would
+    submit a SECOND closing order against a position that's already flat,
+    which on a short leg means opening an unintended naked position. Also
+    covers the bot's exit check racing the dashboard's manual close button
+    on the same position from a different process.
     """
+    pos_key = _position_key(position)
+    if not _claim_close(pos_key):
+        print(f"close_position: {position.get('symbol')} already has a close in flight — skipping duplicate")
+        return False
+
+    closed_ok = False
+    try:
+        closed_ok = _close_position_inner(position, reason)
+        return closed_ok
+    finally:
+        # Only release the claim if the close did NOT succeed. A
+        # successful close already removed the position from local state,
+        # so there's nothing left to re-close; holding the claim until it
+        # ages out is the safer side to err on if anything is still in
+        # flight at the broker.
+        if not closed_ok:
+            _release_close(pos_key)
+
+
+def _close_position_inner(position: dict, reason: str = "Bot decision") -> bool:
     import os, sys
     # Write debug to file so we can see it regardless of stdout buffering
     _dbg = LOG_DIR / "close_debug.log"
@@ -745,6 +885,49 @@ def _get_option_mid(chain, opt_type: str, strike: float) -> float:
 def _position_key(pos: dict) -> str:
     """Stable identity for matching a position across a reload."""
     return str(pos.get("order_id") or pos.get("id") or pos.get("symbol", ""))
+
+
+# How long a close-in-flight claim stays valid. Long enough to cover a
+# hung HTTP request, short enough that a genuinely failed close can be
+# retried on a later cycle rather than being blocked forever.
+_CLOSE_CLAIM_TTL_SEC = 300
+
+
+def _claim_close(pos_key: str) -> bool:
+    """
+    Atomically claim the right to close this position. Returns False if
+    another close for the same position is already in flight (possibly in
+    the other process). Claims older than the TTL are treated as stale and
+    reclaimable, so a crashed close attempt doesn't wedge the position
+    permanently.
+    """
+    claims_file = LOG_DIR / "close_claims.json"
+    now = time.time()
+    with state_store.file_lock("close_claims"):
+        try:
+            claims = json.loads(claims_file.read_text()) if claims_file.exists() else {}
+        except Exception:
+            claims = {}
+
+        claims = {k: v for k, v in claims.items() if now - v < _CLOSE_CLAIM_TTL_SEC}
+        if pos_key in claims:
+            return False
+
+        claims[pos_key] = now
+        state_store.atomic_write_json(claims_file, claims)
+        return True
+
+
+def _release_close(pos_key: str) -> None:
+    """Drop a close claim once the close is fully resolved."""
+    claims_file = LOG_DIR / "close_claims.json"
+    with state_store.file_lock("close_claims"):
+        try:
+            claims = json.loads(claims_file.read_text()) if claims_file.exists() else {}
+        except Exception:
+            return
+        if claims.pop(pos_key, None) is not None:
+            state_store.atomic_write_json(claims_file, claims)
 
 
 def refresh_position_prices():

@@ -314,6 +314,21 @@ def _scan_and_trade_inner():
             if pos.get("type") == "0dte_scalp":
                 executor.close_position(pos, "0DTE forced close — 15:30 ET")
                 print(f"  Force-closed 0DTE {pos['symbol']} at {now_str}")
+
+        # This branch used to return here, which meant non-0DTE positions
+        # got NO exit check at all between 15:30 and 15:45 — and after
+        # 15:45 is_market_open() is False, so the scan returns early and
+        # nothing is monitored again until 09:35 the next morning. A
+        # stop-loss breach in that final 15 minutes went unhandled and
+        # then sat through the overnight gap. Keep checking exits on
+        # everything still open; only new ENTRIES are off the table
+        # this late.
+        remaining = executor.get_open_positions()
+        if remaining:
+            executor.refresh_position_prices()
+            closed = executor.check_exits(claude_brain)
+            if closed:
+                print(f"  Late-session exit check closed {closed} position(s)")
         return
 
     # Refresh Tastytrade session
@@ -324,6 +339,18 @@ def _scan_and_trade_inner():
         )
     except Exception as e:
         print(f"Session refresh error: {e}")
+
+    # ── Step 0: Reconcile local state against the broker ───────────────────────
+    # No-op in sandbox mode. In live mode this catches local state drifting
+    # from reality — an unfilled order tracked as open, a manual trade the
+    # bot doesn't know about, a position closed outside the bot. Advisory
+    # only: it alerts, it doesn't auto-mutate state.
+    try:
+        recon = executor.reconcile_with_broker()
+        if recon.get("in_sync") is False:
+            print(f"⚠️  Broker reconciliation mismatch: {recon}")
+    except Exception as e:
+        print(f"Reconciliation error: {e}")
 
     # ── Step 1: Exit management ────────────────────────────────────────────────
     open_positions = executor.get_open_positions()
@@ -664,6 +691,22 @@ def end_of_day():
     print(f"\nEOD: {stats['trade_count']} trades | P&L: ${stats['pnl']:+.2f} | "
           f"Win rate: {risk['win_rate']}%")
 
+    # Flag anything being carried overnight. Once the session closes there
+    # is genuinely no way to exit — the options market is shut — so the
+    # honest handling is to make the overnight exposure explicit rather
+    # than implying it's still being watched. Exit checks resume at 09:35
+    # ET; gap risk between now and then is unmanaged by design.
+    overnight = executor.get_open_positions()
+    if overnight:
+        lines = [f"• {p.get('symbol')} {p.get('strategy', '')} "
+                 f"(max loss ${p.get('max_loss', 0):.0f}, exp {p.get('expiration', '?')})"
+                 for p in overnight]
+        alerts.risk_warning(
+            f"🌙 Holding {len(overnight)} position(s) overnight — unmonitored until "
+            f"09:35 ET tomorrow (market closed, no exits possible):\n" + "\n".join(lines)
+        )
+        print(f"EOD: {len(overnight)} position(s) held overnight — alerted")
+
     # Nightly ML retrain
     print("Starting nightly ML retrain...")
     try:
@@ -714,12 +757,49 @@ def health_check():
 
 # ── Scheduler Setup ────────────────────────────────────────────────────────────
 
+_daily_job_last_run = {}
+
+
+def _run_daily_at_et(job_name: str, et_hour: int, et_minute: int, fn):
+    """
+    Run `fn` once per calendar day, at or after the given ET wall-clock
+    time.
+
+    schedule.every().day.at("16:00") fires on the SERVER's local clock,
+    and this bot runs on a UTC host — so "16:00" was actually firing at
+    12:00 ET, i.e. the "end of day" summary and ML retrain ran in the
+    middle of every trading session, reporting a half-finished day.
+    Rather than hardcoding a UTC offset (which breaks twice a year at DST
+    boundaries), this is called from a frequent tick and self-guards on
+    the current ET time plus a once-per-day marker.
+    """
+    now_et = _now_et()
+    today = now_et.date()
+    if _daily_job_last_run.get(job_name) == today:
+        return
+    if (now_et.hour, now_et.minute) < (et_hour, et_minute):
+        return
+    _daily_job_last_run[job_name] = today
+    print(f"Running daily job '{job_name}' at {now_et.strftime('%H:%M')} ET")
+    try:
+        fn()
+    except Exception as e:
+        print(f"Daily job '{job_name}' error: {e}")
+        alerts.error(f"daily_job_{job_name}", e)
+
+
+def _daily_job_tick():
+    # 16:00 ET — after the 15:45 close, so the summary covers a finished day.
+    _run_daily_at_et("end_of_day", 16, 0, end_of_day)
+    # 22:00 ET — second retrain well after the session.
+    _run_daily_at_et("nightly_retrain", 22, 0, nightly_retrain)
+
+
 def setup_schedule():
     schedule.every(SCAN_INTERVAL_MINUTES).minutes.do(scan_and_trade)
     schedule.every(REGIME_REFRESH_MINUTES).minutes.do(refresh_regime)
-    schedule.every().day.at("16:00").do(end_of_day)
-    schedule.every().day.at("22:00").do(nightly_retrain)  # second nightly retrain
     schedule.every(2).minutes.do(health_check)
+    schedule.every(1).minutes.do(_daily_job_tick)
 
 
 # ── Main Entry ─────────────────────────────────────────────────────────────────
