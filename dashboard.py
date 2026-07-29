@@ -715,13 +715,23 @@ def api_data_integrity():
     """
     sources = []
 
-    # Broker session / order execution
+    # Broker session / order execution. The dashboard runs as a separate
+    # process from the bot and never authenticates on its own, so a bare
+    # is_authenticated() check here reports "down" even when the bot's
+    # session is perfectly healthy. Load the shared saved token first so
+    # this reflects the actual broker state rather than this process's
+    # own (irrelevant) auth status.
     try:
         import auth
         ok = auth.is_authenticated()
+        if not ok:
+            try:
+                ok = auth._load_saved()
+            except Exception:
+                ok = False
         sources.append({
             "name": "Tastytrade — order execution",
-            "detail": f"account {auth.session.account_number}" if ok else "not authenticated",
+            "detail": f"account {auth.session.account_number}" if ok else "no valid token",
             "status": "live" if ok else "down",
         })
     except Exception as e:
