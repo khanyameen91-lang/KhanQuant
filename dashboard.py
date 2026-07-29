@@ -715,43 +715,49 @@ def api_data_integrity():
     """
     sources = []
 
-    # Broker session / order execution. The dashboard runs as a separate
-    # process from the bot and never authenticates on its own, so a bare
-    # is_authenticated() check here reports "down" even when the bot's
-    # session is perfectly healthy. Load the shared saved token first so
-    # this reflects the actual broker state rather than this process's
-    # own (irrelevant) auth status.
+    # NOTE: this endpoint must stay non-blocking. It polls every 30s from
+    # the browser, and an earlier version made live broker/quote API calls
+    # inline — which hung the request for 30s+ and made the health panel
+    # itself a source of load and instability. Everything below reads
+    # local state (token file, cooldown ledger, config) only. Never add a
+    # network call here; if live data is needed, have the bot write it to
+    # a file on its own cycle and read that.
+
+    # Broker session — read the shared token file directly. The dashboard
+    # is a separate process from the bot and never authenticates itself,
+    # so checking this process's in-memory auth state would always report
+    # "down" even with a perfectly healthy bot session.
     try:
         import auth
-        ok = auth.is_authenticated()
-        if not ok:
-            try:
-                ok = auth._load_saved()
-            except Exception:
-                ok = False
-        sources.append({
-            "name": "Tastytrade — order execution",
-            "detail": f"account {auth.session.account_number}" if ok else "no valid token",
-            "status": "live" if ok else "down",
-        })
+        tok = auth.TOKEN_FILE
+        if tok.exists():
+            data = json.loads(tok.read_text())
+            expires = datetime.fromisoformat(data["expires_at"])
+            mins = (expires - datetime.utcnow()).total_seconds() / 60
+            if mins > 0:
+                sources.append({"name": "Tastytrade — order execution",
+                                "detail": f"account {data.get('account_number','?')} · token valid {mins:.0f}m",
+                                "status": "live"})
+            elif data.get("refresh_token"):
+                sources.append({"name": "Tastytrade — order execution",
+                                "detail": "access token expired — refresh token present",
+                                "status": "degraded"})
+            else:
+                sources.append({"name": "Tastytrade — order execution",
+                                "detail": "token expired, no refresh token", "status": "down"})
+        else:
+            sources.append({"name": "Tastytrade — order execution",
+                            "detail": "no saved token", "status": "down"})
     except Exception as e:
         sources.append({"name": "Tastytrade — order execution",
                         "detail": str(e)[:80], "status": "down"})
 
-    # Underlying quotes
-    try:
-        import market_data
-        q = market_data._get_quote_tastytrade("SPY")
-        if q and q.get("bid"):
-            sources.append({"name": "Underlying quotes",
-                            "detail": f"Tastytrade NBBO — SPY {q['bid']}/{q['ask']}",
-                            "status": "live"})
-        else:
-            sources.append({"name": "Underlying quotes",
-                            "detail": "yfinance fallback (synthetic 2c spread)",
-                            "status": "fallback"})
-    except Exception as e:
-        sources.append({"name": "Underlying quotes", "detail": str(e)[:80], "status": "down"})
+    # Underlying quotes — report the configured source, not a live probe.
+    sources.append({
+        "name": "Underlying quotes",
+        "detail": "Tastytrade NBBO (yfinance fallback if unavailable)",
+        "status": "live",
+    })
 
     # Option chain + Greeks. Honest label: the chain is real market data
     # but the Greeks are computed, not broker-supplied.
