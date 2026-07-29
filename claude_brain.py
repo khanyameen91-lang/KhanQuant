@@ -251,6 +251,23 @@ Confirm the automated recommendation or override it. Respond with JSON only.
         }
     except Exception as e:
         print(f"Warning: LLM API error ({_llm_provider}): {e}")
+        msg = str(e)
+        if "rate_limit" in msg or "429" in msg:
+            # The trade-decision path losing its LLM is materially worse
+            # than a degraded sentiment score — it silently drops every
+            # setup back to the pure-scoring fallback (a different, higher
+            # threshold), so real setups get skipped with only a log line
+            # to show for it. Surface it distinctly.
+            try:
+                import alerts
+                alerts.degraded(
+                    "llm_rate_limit_decisions",
+                    f"Trade-decision LLM is rate limited — setups are falling back to the "
+                    f"pure-scoring threshold instead of LLM review. {msg[:160]}",
+                    cooldown_minutes=60,
+                )
+            except Exception:
+                pass
         result = _scoring_fallback(score, snapshot, f"{_llm_provider} API error")
         print(f"  FALLBACK: {result['reasoning'][:80]}")
         return result

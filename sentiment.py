@@ -14,6 +14,7 @@ Output: Sentiment Score (0-100) + event flags for Claude context.
 """
 
 import os
+import re
 import time
 import json
 import logging
@@ -50,6 +51,39 @@ CLAUDE_AVAILABLE = LLM_AVAILABLE
 
 SENTIMENT_CACHE_FILE = Path("logs/sentiment_cache.json")
 CACHE_TTL = 1800  # 30 minutes — news doesn't change that fast
+# Failed lookups are cached too, but briefly — long enough to stop a
+# failing symbol from re-requesting on every 2-minute scan, short enough
+# to recover quickly once the provider is healthy again.
+FAILURE_CACHE_TTL = 300
+LLM_COOLDOWN_FILE = Path("logs/llm_cooldown.json")
+
+
+def _in_llm_cooldown() -> bool:
+    try:
+        if not LLM_COOLDOWN_FILE.exists():
+            return False
+        return time.time() < json.loads(LLM_COOLDOWN_FILE.read_text()).get("until", 0)
+    except Exception:
+        return False
+
+
+def _set_llm_cooldown(seconds: float) -> None:
+    try:
+        LLM_COOLDOWN_FILE.parent.mkdir(exist_ok=True)
+        LLM_COOLDOWN_FILE.write_text(json.dumps({"until": time.time() + seconds}))
+    except Exception:
+        pass
+
+
+def _parse_retry_after(msg: str) -> float:
+    """Pull the provider's suggested wait out of a rate-limit message
+    (e.g. 'Please try again in 9m57.024s'). Falls back to 10 minutes."""
+    m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", msg)
+    if m:
+        minutes = float(m.group(1) or 0)
+        seconds = float(m.group(2) or 0)
+        return minutes * 60 + seconds + 15   # small buffer past the window
+    return 600.0
 
 
 # ── News Fetching ──────────────────────────────────────────────────────────────
@@ -213,6 +247,16 @@ Rate the current sentiment for options trading:
 Respond with ONLY valid JSON:
 {{"score": 0-100, "sentiment": "BULLISH/BEARISH/NEUTRAL", "key_theme": "one sentence summary", "risk_flags": ["any specific risks"]}}"""
 
+    # Global LLM cooldown: if a previous call was rate-limited, every
+    # symbol's sentiment call would otherwise keep hammering the API on
+    # every 2-minute scan, burning the remaining daily quota AND starving
+    # claude_brain's actual trade decisions, which share the same
+    # provider. Trade decisions matter more than a 12%-weight sentiment
+    # input, so sentiment yields until the cooldown expires.
+    if _in_llm_cooldown():
+        return {"score": 50, "sentiment": "NEUTRAL",
+                "key_theme": "Sentiment paused (LLM quota cooldown)", "risk_flags": []}
+
     try:
         raw = claude_brain._call_llm(
             prompt,
@@ -239,15 +283,39 @@ Respond with ONLY valid JSON:
         _save_cache(cache)
         return result
     except Exception as e:
-        # This used to be a bare `pass` — a dead/rate-limited Anthropic key
-        # would turn sentiment into a permanent, silent neutral 50 with no
-        # log line and no alert anywhere, indistinguishable from a
-        # genuinely neutral read (and this feeds 12% of composite
-        # confidence). Now it's logged and alerted (rate-limited to once/hr
-        # per the alerts.degraded() cooldown) so a dead key doesn't sit
-        # unnoticed indefinitely.
-        log.error(f"sentiment: Claude scoring failed for {symbol}: {e}")
-        alerts.degraded("sentiment_llm", f"Claude sentiment scoring failed: {e}")
+        # This used to be a bare `pass` — a dead/rate-limited key would
+        # turn sentiment into a permanent, silent neutral 50 with no log
+        # line and no alert anywhere, indistinguishable from a genuinely
+        # neutral read (and this feeds 12% of composite confidence).
+        log.error(f"sentiment: LLM scoring failed for {symbol}: {e}")
+
+        msg = str(e)
+        if "rate_limit" in msg or "429" in msg:
+            # Back off globally, not just for this symbol. Honour the
+            # provider's own retry-after hint when it gives one; a daily
+            # token cap can report several minutes, and retrying sooner
+            # just wastes what's left of the quota.
+            wait_sec = _parse_retry_after(msg)
+            _set_llm_cooldown(wait_sec)
+            alerts.degraded(
+                "llm_rate_limit",
+                f"LLM rate limit hit — sentiment paused {wait_sec/60:.0f} min so trade "
+                f"decisions keep their quota. {msg[:160]}",
+                cooldown_minutes=60,
+            )
+        else:
+            alerts.degraded("sentiment_llm", f"Sentiment scoring failed: {e}")
+
+        # Cache the failure too, with a short TTL. Without this, a failing
+        # symbol retries on every single scan (the cache was only written
+        # on success), which is what turned one rate-limit into a storm
+        # that consumed the whole daily allowance.
+        cache[cache_key] = {
+            "data": {"score": 50, "sentiment": "NEUTRAL",
+                     "key_theme": "Unable to score", "risk_flags": []},
+            "ts": time.time() - CACHE_TTL + FAILURE_CACHE_TTL,
+        }
+        _save_cache(cache)
         return {"score": 50, "sentiment": "NEUTRAL", "key_theme": "Unable to score", "risk_flags": []}
 
 
