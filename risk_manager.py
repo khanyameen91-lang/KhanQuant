@@ -170,21 +170,34 @@ def get_portfolio_greeks() -> dict:
     """
     Estimate portfolio-level Greeks from open positions.
     Delta is the most important for directional exposure management.
+
+    Also computes beta_weighted_delta: each position's delta contribution
+    scaled by its underlying's market beta (see BETA_TABLE / get_beta()).
+    This exists because raw delta and sector-bucket counting both miss the
+    same failure mode: a SPY position and a QQQ position are ~2 slots and
+    2 "different sectors" (QQQ was mapped to TECH, SPY to BROAD) but are
+    ~0.9-correlated bets on the same broad-market move. Beta-weighting
+    means two same-direction, similar-beta positions on correlated
+    underlyings correctly stack into one larger effective exposure number,
+    the same way they'd actually move together in a real market swing.
     """
     positions = _load_positions()
     total_delta  = 0.0
     total_gamma  = 0.0
     total_theta  = 0.0
     total_vega   = 0.0
+    total_beta_weighted_delta = 0.0
 
     for pos in positions:
         setup = pos.get("setup", {})
         t = setup.get("type", "")
+        beta = get_beta(pos.get("symbol", ""))
+        pos_delta = 0.0
 
         if t in ("long_option", "0dte_scalp"):
             c = setup.get("contract", {})
             mult = 1 if setup.get("direction") == "bullish" else -1
-            total_delta += c.get("delta", 0) * 100 * mult
+            pos_delta = c.get("delta", 0) * 100 * mult
             total_gamma += c.get("gamma", 0) * 100
             total_theta += c.get("theta", 0) * 100
             total_vega  += c.get("vega", 0) * 100
@@ -193,7 +206,7 @@ def get_portfolio_greeks() -> dict:
             ll = setup.get("long_leg", {})
             sl = setup.get("short_leg", {})
             net_delta = ll.get("delta", 0) - sl.get("delta", 0)
-            total_delta += net_delta * 100
+            pos_delta = net_delta * 100
             total_gamma += (ll.get("gamma", 0) - sl.get("gamma", 0)) * 100
             total_theta += (ll.get("theta", 0) - sl.get("theta", 0)) * 100
             total_vega  += (ll.get("vega", 0) - sl.get("vega", 0)) * 100
@@ -202,7 +215,7 @@ def get_portfolio_greeks() -> dict:
             sl = setup.get("short_leg", {})
             ll = setup.get("long_leg", {})
             net_delta = sl.get("delta", 0) - ll.get("delta", 0)  # short first
-            total_delta -= net_delta * 100  # short = negative delta for calls
+            pos_delta = -net_delta * 100  # short = negative delta for calls
             total_theta += (sl.get("theta", 0) - ll.get("theta", 0)) * 100
 
         elif t == "iron_condor":
@@ -211,21 +224,24 @@ def get_portfolio_greeks() -> dict:
             lp = setup.get("long_put", {})
             sc = setup.get("short_call", {})
             lc = setup.get("long_call", {})
-            ic_delta = (
+            pos_delta = (
                 -sp.get("delta", 0) + lp.get("delta", 0)
                 -sc.get("delta", 0) + lc.get("delta", 0)
             ) * 100
-            total_delta += ic_delta
             total_theta += (sp.get("theta", 0) + sc.get("theta", 0)) * 100  # theta positive for condors
 
         elif t == "strangle":
             lc = setup.get("long_call", {})
             lp = setup.get("long_put", {})
-            total_delta += (lc.get("delta", 0) + lp.get("delta", 0)) * 100
+            pos_delta = (lc.get("delta", 0) + lp.get("delta", 0)) * 100
             total_vega  += (lc.get("vega", 0) + lp.get("vega", 0)) * 100
+
+        total_delta += pos_delta
+        total_beta_weighted_delta += pos_delta * beta
 
     return {
         "net_delta": round(total_delta, 2),
+        "beta_weighted_delta": round(total_beta_weighted_delta, 2),
         "net_gamma": round(total_gamma, 4),
         "net_theta": round(total_theta, 2),
         "net_vega":  round(total_vega, 2),
@@ -320,6 +336,18 @@ def check_all_risk(setup: dict) -> tuple[bool, str]:
     if abs(greeks["net_delta"] + new_delta) > MAX_PORTFOLIO_DELTA:
         return False, f"Portfolio delta exposure too high ({greeks['net_delta']:.0f} + {new_delta:.0f})"
 
+    # 7b. Beta-weighted delta exposure — catches the case the raw delta
+    # check and sector-bucket concentration both miss: two same-direction
+    # positions on different-but-correlated underlyings (e.g. SPY + QQQ,
+    # or two high-beta tech names) that are individually within limits but
+    # move together in a real market swing. See get_portfolio_greeks().
+    new_beta = get_beta(setup.get("symbol", ""))
+    new_beta_weighted_delta = new_delta * new_beta
+    if abs(greeks["beta_weighted_delta"] + new_beta_weighted_delta) > MAX_PORTFOLIO_DELTA:
+        return False, (f"Beta-weighted portfolio exposure too high "
+                       f"({greeks['beta_weighted_delta']:.0f} + {new_beta_weighted_delta:.0f} "
+                       f"vs limit {MAX_PORTFOLIO_DELTA:.0f})")
+
     # 8. Max drawdown for the day
     if stats.get("pnl", 0) < 0:
         drawdown_pct = abs(stats["pnl"]) / ACCOUNT_SIZE * 100
@@ -388,13 +416,40 @@ def calculate_dynamic_stop(position: dict, atr: float, current_price: float) -> 
 # ── Sector Concentration ──────────────────────────────────────────────────────
 
 _SECTOR_MAP = {
-    "SPY": "BROAD", "QQQ": "TECH", "IWM": "BROAD",
+    # QQQ used to be tagged "TECH" (a different bucket than SPY's "BROAD"),
+    # so a SPY position and a QQQ position — two ~0.9-correlated
+    # broad-market bets — never tripped the 2-per-sector limit. QQQ is a
+    # broad index itself (heavily tech-weighted, but still an index, not a
+    # single-sector bet) and belongs in the same bucket as SPY/IWM.
+    "SPY": "BROAD", "QQQ": "BROAD", "IWM": "BROAD",
     "AAPL": "TECH", "MSFT": "TECH", "NVDA": "TECH",
     "AMD": "TECH", "META": "TECH", "GOOGL": "TECH",
     "AMZN": "TECH", "TSLA": "CONS_DISC",
     "JPM": "FINANCE", "BAC": "FINANCE", "GS": "FINANCE",
     "XLE": "ENERGY", "XLF": "FINANCE", "XLV": "HEALTH",
 }
+
+# Approximate market betas for the bot's fixed watchlist universe. Static
+# rather than fetched live so a risk-gate check never depends on a network
+# call succeeding — sector-bucket counting is a blunt instrument for
+# correlation risk (it can only say "same bucket or not"); beta-weighting
+# the portfolio delta check (see get_portfolio_greeks) captures how much
+# two DIFFERENT-bucket but similarly-market-sensitive positions actually
+# move together in a broad market swing, not just whether they share a
+# hand-assigned label. Unknown symbols default to 1.0 (market-neutral
+# assumption) in get_beta().
+BETA_TABLE = {
+    "SPY": 1.00, "QQQ": 1.05, "IWM": 1.15,
+    "AAPL": 1.10, "MSFT": 0.90, "NVDA": 1.65, "AMD": 1.70,
+    "META": 1.20, "AMZN": 1.15, "GOOGL": 1.05, "TSLA": 2.00,
+    "PLTR": 2.20, "JPM": 1.05, "BAC": 1.20, "GS": 1.25,
+    "XLE": 0.95, "XLF": 1.10, "XLV": 0.75,
+}
+
+
+def get_beta(symbol: str) -> float:
+    return BETA_TABLE.get(symbol, 1.0)
+
 
 def check_sector_concentration(symbol: str) -> tuple[bool, str]:
     """
@@ -440,6 +495,7 @@ def get_risk_summary() -> dict:
         "trading_halted":      rs.trading_halted,
         "halt_reason":         rs.halt_reason,
         "portfolio_delta":     greeks["net_delta"],
+        "beta_weighted_delta": greeks["beta_weighted_delta"],
         "portfolio_theta":     greeks["net_theta"],
         "portfolio_vega":      greeks["net_vega"],
         "max_portfolio_delta": MAX_PORTFOLIO_DELTA,

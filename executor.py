@@ -22,6 +22,10 @@ import profit_protection
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", 200))
 MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 150))
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", 3))
+# How old a position's last successful price refresh can be before
+# check_exits() stops trusting it for P&L-based stop-loss/profit-target
+# decisions. Default 6 min = 3 missed 2-minute scan cycles in a row.
+STALE_PRICE_THRESHOLD_SEC = int(os.environ.get("STALE_PRICE_THRESHOLD_SEC", 360))
 
 # ── Trade Log ──────────────────────────────────────────────────────────────────
 LOG_DIR = Path("logs")
@@ -315,9 +319,14 @@ def place_order(setup: dict, decision: dict) -> dict | None:
 
 
 # ── Position Monitoring ────────────────────────────────────────────────────────
-def get_position_pnl(position: dict) -> float:
+def get_position_pnl(position: dict):
     """
-    Calculate current P&L for an open position.
+    Calculate current P&L for an open position. Returns None (not a silent
+    0.0) if it genuinely can't be determined — a real loss on a position
+    whose fetch is failing shouldn't read as "flat," which used to look
+    identical to a real $0 P&L both in the stop-loss check and on the
+    dashboard.
+
     In sandbox mode, use the yfinance-refreshed unrealized_pnl field.
     In live mode, fetch from Tastytrade API.
     """
@@ -333,10 +342,19 @@ def get_position_pnl(position: dict) -> float:
         for pos in positions_data:
             if pos.get("symbol") == position["symbol"]:
                 return float(pos.get("today-pnl", pos.get("pnl", 0)))
-        return 0.0
+        # Position not found in the broker's own list — that's not "$0
+        # P&L," that's "we don't know," and worth flagging distinctly
+        # since it could mean the position was closed outside the bot.
+        alerts.degraded(
+            f"pnl_missing_{position.get('symbol', '?')}",
+            "Position not found in broker's live position list",
+            cooldown_minutes=30,
+        )
+        return None
     except Exception as e:
         print(f"⚠️  PnL fetch error: {e}")
-        return 0.0
+        alerts.degraded(f"pnl_fetch_{position.get('symbol', '?')}", f"PnL fetch error: {e}", cooldown_minutes=30)
+        return None
 
 
 def close_position(position: dict, reason: str = "Bot decision") -> bool:
@@ -504,6 +522,15 @@ def close_position(position: dict, reason: str = "Bot decision") -> bool:
 
         # Calculate final PnL, update stats, remove position, log journal
         pnl = get_position_pnl(position)
+        if pnl is None:
+            # Couldn't confirm the real fill P&L from the broker (already
+            # alerted inside get_position_pnl). Recording it as $0 would
+            # silently corrupt today's stats and the win/loss counters —
+            # log it clearly instead and record a neutral placeholder that
+            # a human needs to reconcile manually, rather than pretending
+            # it was a scratch trade.
+            _log(f"WARNING: could not determine final P&L for {position.get('symbol')} — recording as $0, needs manual reconciliation")
+            pnl = 0.0
         stats = _load_daily_stats()
         stats["pnl"] = round(stats.get("pnl", 0.0) + pnl, 2)
         stats["trade_count"] = stats.get("trade_count", 0) + 1
@@ -600,7 +627,10 @@ def check_exits(brain) -> int:
         max_loss = position.get("max_loss", 150)
         max_profit = position.get("max_profit") or max_loss * 2
 
-        pnl_pct = (pnl / max_loss) * 100 if max_loss else 0
+        # pnl can be None now (live-mode fetch failure — see
+        # get_position_pnl) instead of a silent 0.0 that looked
+        # indistinguishable from a genuinely flat position.
+        pnl_pct = (pnl / max_loss) * 100 if (max_loss and pnl is not None) else 0
 
         # Calculate DTE remaining
         try:
@@ -613,6 +643,49 @@ def check_exits(brain) -> int:
         if dte_remaining <= 1:
             close_position(position, "1 DTE — forced close")
             closed += 1
+            continue
+
+        if pnl is None:
+            alerts.degraded(
+                f"pnl_fetch_{position.get('symbol', '?')}",
+                "Couldn't fetch this position's live P&L from the broker — "
+                "skipping stop/target checks this cycle (DTE-based exit still applies)",
+                cooldown_minutes=30,
+            )
+            continue
+
+        # Price staleness check. refresh_position_prices() used to fail
+        # silently per-position (a chain fetch error, a missing strike) and
+        # just leave unrealized_pnl at whatever value it last had — with no
+        # way to tell "this is current" from "this hasn't updated in
+        # hours." A real loss could sit unnoticed indefinitely because it
+        # never crossed the stop-loss threshold computed from a frozen
+        # number, while the dashboard kept showing a plausible P&L the
+        # whole time. Skip the P&L-based checks below (not the DTE check
+        # above, which doesn't need a live price) when the price is too
+        # old to trust, and alert — a position with a stuck price feed is
+        # exactly the kind of thing that needs a human to look at it.
+        updated_at = position.get("price_updated_at")
+        price_age_sec = None
+        if updated_at:
+            try:
+                price_age_sec = (datetime.now() - datetime.fromisoformat(updated_at)).total_seconds()
+            except Exception:
+                price_age_sec = None
+
+        if updated_at and (price_age_sec is None or price_age_sec > STALE_PRICE_THRESHOLD_SEC):
+            age_desc = "an unreadable timestamp" if price_age_sec is None else f"{price_age_sec/60:.0f} min"
+            alerts.degraded(
+                f"stale_price_{position.get('symbol', '?')}",
+                f"No successful price refresh in {age_desc} — skipping P&L-based "
+                f"stop/target checks this cycle (DTE-based exit still applies)",
+                cooldown_minutes=30,
+            )
+            continue
+        # updated_at is None (no timestamp at all yet) just means this
+        # position hasn't been through its first refresh cycle — not a
+        # failure, nothing to alert about, just nothing to check yet either.
+        elif updated_at is None:
             continue
 
         if pnl <= -(max_loss * stop_frac):
@@ -724,7 +797,8 @@ def refresh_position_prices():
 
                 pos["unrealized_pnl"]   = unrealized_pnl
                 pos["pnl_pct"]          = pnl_pct
-                pos["price_updated_at"] = datetime.now().strftime("%H:%M:%S")
+                pos["price_updated_at"] = datetime.now().isoformat()
+                pos["price_stale"] = False
                 updated = True
 
             # ── Single-leg options ────────────────────────────────────────────
@@ -748,7 +822,8 @@ def refresh_position_prices():
                 pos["entry_price"]      = round(entry_price, 2)
                 pos["unrealized_pnl"]   = unrealized_pnl
                 pos["pnl_pct"]          = pnl_pct
-                pos["price_updated_at"] = datetime.now().strftime("%H:%M:%S")
+                pos["price_updated_at"] = datetime.now().isoformat()
+                pos["price_stale"] = False
                 updated = True
 
         except Exception as e:
