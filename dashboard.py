@@ -16,6 +16,7 @@ from pathlib import Path
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context, redirect
 from dotenv import load_dotenv
 import auth
+import state_store
 
 load_dotenv()
 
@@ -23,8 +24,8 @@ app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.jinja_env.auto_reload = True
 
-LOG_DIR = Path("logs")
-POSITIONS_FILE = LOG_DIR / "positions.json"
+LOG_DIR = state_store.LOG_DIR
+POSITIONS_FILE = state_store.POSITIONS_FILE
 BOT_LOG_FILE = LOG_DIR / "bot.log"
 
 # ── SSE log streaming ──────────────────────────────────────────────────────────
@@ -51,24 +52,12 @@ threading.Thread(target=tail_log_file, daemon=True).start()
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
-def load_positions():
-    if POSITIONS_FILE.exists():
-        try:
-            return json.loads(POSITIONS_FILE.read_text())
-        except Exception:
-            pass
-    return []
-
-
-def load_daily_stats():
-    today = date.today().isoformat()
-    stats_file = LOG_DIR / f"stats_{today}.json"
-    if stats_file.exists():
-        try:
-            return json.loads(stats_file.read_text())
-        except Exception:
-            pass
-    return {"date": today, "pnl": 0.0, "trade_count": 0, "winners": 0, "losers": 0}
+# Positions/daily-stats loading lives in state_store.py (single source of
+# truth shared with the bot process). load_daily_stats() surfaces a
+# `_corrupted` flag instead of silently showing a fake $0.00 day when the
+# stats file is unreadable — see state_store.load_daily_stats().
+load_positions = state_store.load_positions
+load_daily_stats = state_store.load_daily_stats
 
 
 def load_trade_history(limit=50):

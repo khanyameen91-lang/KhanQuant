@@ -28,6 +28,8 @@ import requests
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import alerts
+
 FINNHUB_KEY  = os.environ.get("FINNHUB_API_KEY", "")
 BASE_URL     = "https://finnhub.io/api/v1"
 LOG_DIR      = Path("logs")
@@ -99,9 +101,18 @@ def _get(endpoint: str, params: dict) -> any:
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        # Silently suppress 403 (premium endpoint) and connection errors
+        # 403 means the configured Finnhub key doesn't have access to this
+        # endpoint (a premium tier). This used to be suppressed entirely —
+        # not even a print — so the caller's scorer silently returns its
+        # neutral-50 default and nothing anywhere records that the feature
+        # is actually just unavailable, not "reads as neutral." Still don't
+        # spam the console every 2-minute scan, but do surface it via the
+        # rate-limited degraded() alert so it's visible at least once.
         msg = str(e)
-        if "403" not in msg and "404" not in msg:
+        if "403" in msg or "404" in msg:
+            alerts.degraded(f"finnhub_{endpoint.split('/')[0]}",
+                             f"{endpoint} returned {msg[:80]} — likely not available on this API tier")
+        else:
             print(f"  [intel] {endpoint}: {e}")
         return None
 

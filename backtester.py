@@ -18,6 +18,7 @@ Usage:
   python backtester.py --strategy credit_spread — filter by strategy
 """
 
+import os
 import json
 import math
 import random
@@ -41,7 +42,7 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
-ACCOUNT_SIZE = 5000.0   # For % return calculations
+ACCOUNT_SIZE = float(os.environ.get("ACCOUNT_SIZE", 5000))   # For % return calculations
 
 
 # ── Data Loading ───────────────────────────────────────────────────────────────
@@ -58,8 +59,11 @@ def load_trades(strategy_filter: str = None, min_trades: int = 5) -> list:
         print(f"Error loading journal: {e}")
         return []
 
-    # Filter to closed trades with P&L
-    trades = [t for t in trades if t.get("pnl") is not None and t.get("exit_date")]
+    # Filter to closed trades with P&L. executor.py writes the close
+    # timestamp as "closed_at" — this used to check "exit_date", a field
+    # that's never written, so load_trades() always returned [] against
+    # the real journal.
+    trades = [t for t in trades if t.get("pnl") is not None and t.get("closed_at")]
 
     if strategy_filter:
         trades = [t for t in trades

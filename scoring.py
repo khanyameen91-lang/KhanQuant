@@ -411,10 +411,18 @@ def score_trade(
         ts.ev_score = 50.0   # Neutral if not computable
 
     # ── 8. Liquidity ──────────────────────────────────────────────────────────
+    # liquidity_approved gates the final action below (see "Action
+    # classification") — liquidity.py's own stated purpose is "if you can't
+    # get a fair fill, don't trade," but until now its pass/fail result only
+    # moved the composite score by 4% of its weight, so a contract that
+    # failed its own OI/volume/spread minimums could still score high
+    # enough on the other 9 factors to trade anyway.
+    liquidity_approved = True
     if LIQ_AVAILABLE and snapshot:
         liq_result       = score_setup_liquidity(snapshot)
         ts.liquidity_score = float(liq_result.get("liquidity_score", 50))
         if not liq_result.get("approved"):
+            liquidity_approved = False
             ts.key_risks.append(f"Liquidity: {liq_result.get('reject_reason', 'Poor liquidity')}")
     else:
         ts.liquidity_score = 50.0
@@ -454,18 +462,20 @@ def score_trade(
     if not skip_sentiment and sent_data.get("earnings", {}).get("has_earnings_soon"):
         raw_confidence *= 0.85
 
-    # EV hard check: if EV is deeply negative, cap score at 60
-    if EV_AVAILABLE and snapshot:
-        ev_result = compute_ev(snapshot.get("setup", {}), ml_win_prob)
-        if ev_result.get("ev_dollars", 0) < -20:
-            raw_confidence = min(raw_confidence, 60.0)
+    # EV hard check: if EV is deeply negative, cap score at 60.
+    # (Reuses ev_result computed in step 7 above instead of calling
+    # compute_ev() a second time for the same setup.)
+    if EV_AVAILABLE and snapshot and ev_result.get("ev_dollars", 0) < -20:
+        raw_confidence = min(raw_confidence, 60.0)
 
     ts.confidence = round(max(0, min(100, raw_confidence)), 1)
 
     # ── Action classification (RAISED THRESHOLDS) ─────────────────────────────
     min_conf = MIN_CONFIDENCE.get(strategy_type, 80)
 
-    if ts.confidence >= 80:
+    if not liquidity_approved:
+        ts.action = "SKIP"           # Liquidity veto — no confidence score overrides this
+    elif ts.confidence >= 80:
         ts.action = "AUTO_EXECUTE"   # Strong conviction — execute
     elif ts.confidence >= 70:
         ts.action = "ALERT"          # Good setup — execute if budget allows

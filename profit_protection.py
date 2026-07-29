@@ -22,11 +22,12 @@ import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-LOG_DIR          = Path("logs")
-def _daily_stats_file() -> Path:
-    return LOG_DIR / f"stats_{date.today().isoformat()}.json"
-WEEKLY_FILE      = LOG_DIR / "weekly_stats.json"
-PROTECTION_FILE  = LOG_DIR / "profit_protection_state.json"
+import state_store
+
+LOG_DIR          = state_store.LOG_DIR
+_daily_stats_file = state_store.daily_stats_file
+WEEKLY_FILE      = state_store.WEEKLY_STATS_FILE
+PROTECTION_FILE  = state_store.PROTECTION_STATE_FILE
 
 ACCOUNT_SIZE     = float(os.environ.get("ACCOUNT_SIZE", 5000))
 
@@ -47,26 +48,10 @@ CONSECUTIVE_LOSS_PAUSE = int(os.environ.get("CONSECUTIVE_LOSS_HALT", 3))
 
 # ── State management ───────────────────────────────────────────────────────────
 
-def _load_daily_stats() -> dict:
-    f = _daily_stats_file()
-    if f.exists():
-        try:
-            return json.loads(f.read_text())
-        except Exception:
-            pass
-    return {"pnl": 0.0, "trade_count": 0, "winners": 0, "losers": 0}
+_load_daily_stats = state_store.load_daily_stats
 
 
-def _load_weekly_stats() -> dict:
-    if WEEKLY_FILE.exists():
-        try:
-            data = json.loads(WEEKLY_FILE.read_text())
-            # Validate it's current week
-            week_start = _get_week_start()
-            if data.get("week_start") == week_start.isoformat():
-                return data
-        except Exception:
-            pass
+def _empty_weekly_stats() -> dict:
     return {
         "week_start":   _get_week_start().isoformat(),
         "pnl":          0.0,
@@ -78,9 +63,24 @@ def _load_weekly_stats() -> dict:
     }
 
 
+def _load_weekly_stats() -> dict:
+    data, err = state_store.load_weekly_stats_raw()
+    if err is not None:
+        # Fails CLOSED: a corrupt weekly file is flagged, not silently
+        # replaced with a fresh $0 week that would hide a halt-worthy loss.
+        stats = _empty_weekly_stats()
+        stats["_corrupted"] = True
+        return stats
+    if data is None:
+        return _empty_weekly_stats()
+    # A stale week_start is a legitimate rollover (new week), not corruption.
+    if data.get("week_start") == _get_week_start().isoformat():
+        return data
+    return _empty_weekly_stats()
+
+
 def _save_weekly_stats(stats: dict):
-    LOG_DIR.mkdir(exist_ok=True)
-    WEEKLY_FILE.write_text(json.dumps(stats, indent=2))
+    state_store.save_weekly_stats(stats)
 
 
 def _get_week_start() -> date:
@@ -89,13 +89,9 @@ def _get_week_start() -> date:
 
 
 def _load_protection_state() -> dict:
-    if PROTECTION_FILE.exists():
-        try:
-            data = json.loads(PROTECTION_FILE.read_text())
-            if data.get("date") == date.today().isoformat():
-                return data
-        except Exception:
-            pass
+    data, err = state_store.load_protection_state_raw()
+    if err is None and data is not None and data.get("date") == date.today().isoformat():
+        return data
     return {
         "date":                date.today().isoformat(),
         "peak_daily_pnl":      0.0,
@@ -109,8 +105,7 @@ def _load_protection_state() -> dict:
 
 
 def _save_protection_state(state: dict):
-    LOG_DIR.mkdir(exist_ok=True)
-    PROTECTION_FILE.write_text(json.dumps(state, indent=2))
+    state_store.save_protection_state(state)
 
 
 # ── Main profit protection check ───────────────────────────────────────────────
@@ -140,6 +135,12 @@ def get_protection_status() -> dict:
     daily_pnl  = float(daily.get("pnl", 0.0))
     weekly_pnl = float(weekly.get("pnl", 0.0))
     messages   = []
+
+    # Fail CLOSED: if we can't reliably read today's or this week's P&L,
+    # don't let a fresh-looking $0.00 quietly grant full size / no halt.
+    state_unreadable = bool(daily.get("_corrupted") or weekly.get("_corrupted"))
+    if state_unreadable:
+        messages.append("🛑 STATE FILE UNREADABLE — protection cannot verify P&L, new entries blocked")
 
     # ── Update peak daily P&L ──────────────────────────────────────────────────
     if daily_pnl > state["peak_daily_pnl"]:
@@ -188,11 +189,14 @@ def get_protection_status() -> dict:
     min_pct = 0.02 * ACCOUNT_SIZE
     # Only fire drawback alert if we've actually had trades today (daily_pnl != 0)
     # This prevents stale-peak false alarms after a bot restart
-    if peak >= 0.05 * ACCOUNT_SIZE and daily_pnl < min_pct and daily_pnl != 0.0:
-        # Was up 5%, now below 2% — alert
+    drawback_alert = (peak >= 0.05 * ACCOUNT_SIZE and daily_pnl < min_pct and daily_pnl != 0.0)
+    if drawback_alert:
+        # Was up 5%, now below 2% — this used to be message-only (nothing ever
+        # actually closed a position over it). executor.check_exits() now reads
+        # this flag and force-closes every open position when it's set.
         messages.append(
             f"🚨 DRAWBACK ALERT: Was up ${peak:.2f}, now ${daily_pnl:.2f} "
-            f"— close positions immediately"
+            f"— closing all positions"
         )
 
     # ── Weekly loss limit ──────────────────────────────────────────────────────
@@ -204,6 +208,18 @@ def get_protection_status() -> dict:
             f"Weekly loss limit hit: ${weekly_pnl:.2f} (limit: -${WEEKLY_LOSS_LIMIT:.0f})"
         )
         messages.append(f"🛑 WEEKLY HALT: {weekly_halt_reason}")
+
+    # State-file corruption overrides everything above: block new entries
+    # and tighten stops regardless of what the (unreliable) P&L numbers say.
+    if state_unreadable:
+        halted = True
+        level = "HALT"
+        size_mult = 0.0
+        stop_level = min(stop_level, 0.50)
+        # Don't force-close positions off of P&L numbers we just said we
+        # can't trust — corruption blocks new entries, it doesn't trigger
+        # the drawback close.
+        drawback_alert = False
 
     # ── Update and save state ──────────────────────────────────────────────────
     state.update({
@@ -226,6 +242,8 @@ def get_protection_status() -> dict:
         "weekly_halted":       weekly_halted,
         "weekly_halt_reason":  weekly_halt_reason,
         "peak_daily_pnl":      peak,
+        "state_unreadable":    state_unreadable,
+        "drawback_alert":      drawback_alert,
         "messages":            messages,
     }
 

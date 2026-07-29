@@ -19,13 +19,9 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from calendar import month_abbr
 
-LOG_DIR            = Path("logs")
-POSITIONS_FILE     = LOG_DIR / "positions.json"
-def _daily_stats_file() -> Path:
-    return LOG_DIR / f"stats_{date.today().isoformat()}.json"
-JOURNAL_FILE       = LOG_DIR / "trade_journal.json"
-RISK_STATE_FILE    = LOG_DIR / "risk_state.json"
-MONTHLY_STATS_FILE = LOG_DIR / f"monthly_{date.today().strftime('%Y_%m')}.json"
+import state_store
+
+LOG_DIR = state_store.LOG_DIR
 
 # ── Risk Limits (from env or defaults) ────────────────────────────────────────
 DAILY_LOSS_LIMIT       = float(os.environ.get("DAILY_LOSS_LIMIT", 200))
@@ -59,75 +55,18 @@ STRATEGY_MAX_CONCURRENT = {
 }
 
 
-@dataclass
-class RiskState:
-    consecutive_losses: int  = 0
-    trading_halted:     bool = False
-    halt_reason:        str  = ""
-    peak_daily_pnl:     float = 0.0
-    current_drawdown:   float = 0.0
-    last_updated:       str  = ""
+# RiskState, load/save for risk state + daily stats + positions + monthly
+# stats now live in state_store.py (single source of truth, atomic writes,
+# fails CLOSED on corrupted state instead of silently resetting to "fine").
+RiskState = state_store.RiskState
+_load_risk_state = state_store.load_risk_state
+_save_risk_state = state_store.save_risk_state
+_load_positions = state_store.load_positions
+_load_daily_stats = state_store.load_daily_stats
+_load_journal = state_store.load_journal
 
 
-def _load_risk_state() -> RiskState:
-    if RISK_STATE_FILE.exists():
-        try:
-            d = json.loads(RISK_STATE_FILE.read_text())
-            return RiskState(**d)
-        except Exception:
-            pass
-    return RiskState()
-
-
-def _save_risk_state(rs: RiskState):
-    LOG_DIR.mkdir(exist_ok=True)
-    rs.last_updated = datetime.now().isoformat()
-    RISK_STATE_FILE.write_text(json.dumps(rs.__dict__, indent=2))
-
-
-def _load_positions() -> list:
-    if POSITIONS_FILE.exists():
-        try:
-            return json.loads(POSITIONS_FILE.read_text())
-        except Exception:
-            return []
-    return []
-
-
-def _load_daily_stats() -> dict:
-    f = _daily_stats_file()
-    if f.exists():
-        try:
-            return json.loads(f.read_text())
-        except Exception:
-            pass
-    return {"date": date.today().isoformat(), "pnl": 0.0, "trade_count": 0,
-            "winners": 0, "losers": 0}
-
-
-def _load_journal() -> list:
-    if JOURNAL_FILE.exists():
-        try:
-            return json.loads(JOURNAL_FILE.read_text())
-        except Exception:
-            return []
-    return []
-
-
-def _load_monthly_stats() -> dict:
-    if MONTHLY_STATS_FILE.exists():
-        try:
-            return json.loads(MONTHLY_STATS_FILE.read_text())
-        except Exception:
-            pass
-    return {
-        "month": date.today().strftime("%Y-%m"),
-        "pnl": 0.0,
-        "trade_count": 0,
-        "strategy_pnl": {},
-        "winners": 0,
-        "losers": 0,
-    }
+_load_monthly_stats = state_store.load_monthly_stats
 
 
 def update_monthly_stats(trade_pnl: float, strategy_type: str = "default"):
@@ -144,9 +83,9 @@ def update_monthly_stats(trade_pnl: float, strategy_type: str = "default"):
     key = strategy_type.lower()
     by_strat[key] = round(by_strat.get(key, 0.0) + trade_pnl, 2)
     stats["strategy_pnl"] = by_strat
+    stats.pop("_corrupted", None)
 
-    LOG_DIR.mkdir(exist_ok=True)
-    MONTHLY_STATS_FILE.write_text(json.dumps(stats, indent=2))
+    state_store.save_monthly_stats(stats)
     return stats
 
 
@@ -327,12 +266,20 @@ def check_all_risk(setup: dict) -> tuple[bool, str]:
 
     Call this BEFORE any order placement.
     """
-    positions  = _load_positions()
+    positions, positions_ok = state_store.load_positions_checked()
     stats      = _load_daily_stats()
     rs         = _load_risk_state()
     greeks     = get_portfolio_greeks()
 
     # ── Hard stops ────────────────────────────────────────────────────────────
+
+    # 0. State integrity — if we can't reliably read what's open or what
+    #    today's P&L is, we don't actually know if a new trade is safe.
+    #    Fail closed instead of guessing "probably fine."
+    if not positions_ok:
+        return False, "Positions file unreadable — halting until resolved"
+    if stats.get("_corrupted"):
+        return False, "Daily stats file unreadable — halting until resolved"
 
     # 1. Trading halt
     if rs.trading_halted:
@@ -381,6 +328,8 @@ def check_all_risk(setup: dict) -> tuple[bool, str]:
 
     # 9. Monthly loss limit
     monthly = _load_monthly_stats()
+    if monthly.get("_corrupted"):
+        return False, "Monthly stats file unreadable — halting until resolved"
     monthly_pnl = monthly.get("pnl", 0.0)
     if monthly_pnl <= -MONTHLY_LOSS_LIMIT:
         return False, f"Monthly loss limit hit (${abs(monthly_pnl):.0f}/${MONTHLY_LOSS_LIMIT:.0f})"
@@ -452,7 +401,9 @@ def check_sector_concentration(symbol: str) -> tuple[bool, str]:
     Ensure we're not overconcentrated in one sector.
     Max 2 positions in same sector.
     """
-    positions = _load_positions()
+    positions, positions_ok = state_store.load_positions_checked()
+    if not positions_ok:
+        return False, "Positions file unreadable — halting until resolved"
     sector = _SECTOR_MAP.get(symbol, "OTHER")
     same_sector = [p for p in positions
                    if _SECTOR_MAP.get(p.get("symbol", ""), "OTHER") == sector]

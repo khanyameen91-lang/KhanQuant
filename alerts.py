@@ -6,8 +6,12 @@ All bot activity (trades, errors, daily summaries) flows through here.
 """
 
 import os
+import json
 import requests
 from datetime import datetime
+from pathlib import Path
+
+_DEGRADED_COOLDOWN_FILE = Path("logs") / "alert_cooldowns.json"
 
 
 # ── Core send function ─────────────────────────────────────────────────────────
@@ -126,6 +130,59 @@ def error(context: str, err: Exception):
         f"⏰ {datetime.now().strftime('%H:%M:%S')}"
     )
     send(msg)
+
+
+def _load_cooldowns() -> dict:
+    if _DEGRADED_COOLDOWN_FILE.exists():
+        try:
+            return json.loads(_DEGRADED_COOLDOWN_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cooldowns(cd: dict):
+    _DEGRADED_COOLDOWN_FILE.parent.mkdir(exist_ok=True)
+    _DEGRADED_COOLDOWN_FILE.write_text(json.dumps(cd, indent=2))
+
+
+def degraded(source: str, detail: str, cooldown_minutes: int = 60) -> bool:
+    """
+    Alert that a data source or subsystem has silently degraded to a
+    fallback/neutral value instead of a real reading — auth failures,
+    a dead API key, an LLM call that's been failing, a feed that's stopped
+    resolving. Several of these used to fail into a plausible-looking
+    neutral score (50/100, "NEUTRAL") with no log line and no alert
+    anywhere, which is indistinguishable on the dashboard from a genuinely
+    neutral reading.
+
+    Rate-limited per `source` (default once per hour) so a subsystem that's
+    been down for days doesn't re-alert on every 2-minute scan cycle.
+    Returns True if an alert was actually sent (i.e. not suppressed by the
+    cooldown), mainly useful for tests.
+    """
+    cd = _load_cooldowns()
+    now = datetime.now()
+    last = cd.get(source)
+    if last:
+        try:
+            elapsed_min = (now - datetime.fromisoformat(last)).total_seconds() / 60
+            if elapsed_min < cooldown_minutes:
+                return False
+        except Exception:
+            pass
+
+    msg = (
+        f"🟡 <b>DATA SOURCE DEGRADED</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Source:</b> {source}\n"
+        f"💬 <b>Detail:</b> {detail[:200]}\n"
+        f"⏰ {now.strftime('%H:%M:%S')}"
+    )
+    send(msg)
+    cd[source] = now.isoformat()
+    _save_cooldowns(cd)
+    return True
 
 
 # ── Phase 3: Protection / Halt / Regime / Weekly alerts ──────────────────────

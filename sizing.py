@@ -17,8 +17,9 @@ import json
 from datetime import date
 from pathlib import Path
 
-DAILY_STATS_FILE  = Path(f"logs/stats_{date.today().isoformat()}.json")
-JOURNAL_FILE      = Path("logs/trade_journal.json")
+import state_store
+
+JOURNAL_FILE      = state_store.JOURNAL_FILE
 
 # Account parameters
 ACCOUNT_SIZE      = float(os.environ.get("ACCOUNT_SIZE", 5000))
@@ -29,13 +30,7 @@ MIN_POSITION_SIZE = 25.0   # never risk less than $25
 
 # ── Helper data loading ────────────────────────────────────────────────────────
 
-def _load_daily_stats() -> dict:
-    if DAILY_STATS_FILE.exists():
-        try:
-            return json.loads(DAILY_STATS_FILE.read_text())
-        except Exception:
-            pass
-    return {"pnl": 0.0, "trade_count": 0, "winners": 0, "losers": 0}
+_load_daily_stats = state_store.load_daily_stats
 
 
 def _load_recent_trades(lookback: int = 20) -> list:

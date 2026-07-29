@@ -12,8 +12,13 @@ from datetime import datetime, date
 from pathlib import Path
 from auth import session
 import alerts
+import state_store
+import profit_protection
 
 # ── Risk Configuration (loaded from env) ──────────────────────────────────────
+# Kept here for backward compatibility (bot.py's v1-fallback stub imports
+# these directly) — the actual risk *decision* now always goes through
+# risk_manager.check_all_risk(); see check_risk() below.
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", 200))
 MAX_POSITION_SIZE = float(os.environ.get("MAX_POSITION_SIZE", 150))
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", 3))
@@ -27,52 +32,19 @@ def _daily_stats_file() -> Path:
 JOURNAL_FILE = LOG_DIR / "trade_journal.json"
 
 
-def _load_journal() -> list:
-    if JOURNAL_FILE.exists():
-        try:
-            return json.loads(JOURNAL_FILE.read_text())
-        except Exception:
-            return []
-    return []
+# Journal/positions/daily-stats load+save now live in state_store.py (single
+# source of truth, atomic writes, fails closed on corrupted state). Kept as
+# aliases here since the rest of this file — and bot.py's v1-fallback stub —
+# calls them by these names.
+_load_journal = state_store.load_journal
+_load_positions = state_store.load_positions
+_save_positions = state_store.save_positions
+_load_daily_stats = state_store.load_daily_stats
+_save_daily_stats = state_store.save_daily_stats
 
 
 def _append_journal(entry: dict):
-    journal = _load_journal()
-    journal.insert(0, entry)
-    journal = journal[:500]  # keep last 500 trades
-    JOURNAL_FILE.write_text(json.dumps(journal, indent=2))
-
-
-def _load_positions() -> list:
-    """Load open positions from disk."""
-    if POSITIONS_FILE.exists():
-        try:
-            return json.loads(POSITIONS_FILE.read_text())
-        except Exception:
-            return []
-    return []
-
-
-def _save_positions(positions: list):
-    """Persist open positions to disk."""
-    POSITIONS_FILE.write_text(json.dumps(positions, indent=2))
-
-
-def _load_daily_stats() -> dict:
-    """Load today's trading stats."""
-    f = _daily_stats_file()
-    if f.exists():
-        try:
-            return json.loads(f.read_text())
-        except Exception:
-            pass
-    return {"date": date.today().isoformat(), "pnl": 0.0, "trade_count": 0,
-            "winners": 0, "losers": 0}
-
-
-def _save_daily_stats(stats: dict):
-    """Persist daily stats to disk."""
-    _daily_stats_file().write_text(json.dumps(stats, indent=2))
+    state_store.append_journal(entry)
 
 
 # ── Risk Checks ────────────────────────────────────────────────────────────────
@@ -80,33 +52,19 @@ def check_risk(setup: dict) -> tuple[bool, str]:
     """
     Run all risk checks before allowing a trade.
     Returns (approved: bool, reason: str)
+
+    This used to be its own, narrower 5-check reimplementation of
+    risk_manager.check_all_risk() — no halt-state check, no delta/drawdown/
+    monthly/sector/strategy-concentration checks. Two independently
+    maintained risk gates is exactly how one of them quietly drifts out of
+    sync with the other (e.g. a future caller that reaches place_order()
+    without going through bot.py's upstream check_all_risk() call would
+    have bypassed the trading halt entirely). There is now exactly one risk
+    gate: risk_manager.check_all_risk(). This function delegates to it so
+    every order-placement path — today's and any future one — is covered.
     """
-    positions = _load_positions()
-    stats = _load_daily_stats()
-
-    # Check 1: Max open positions
-    if len(positions) >= MAX_OPEN_POSITIONS:
-        return False, f"Max open positions reached ({MAX_OPEN_POSITIONS})"
-
-    # Check 2: Daily loss limit
-    if stats["pnl"] <= -DAILY_LOSS_LIMIT:
-        return False, f"Daily loss limit hit (${abs(stats['pnl']):.0f} lost today)"
-
-    # Check 3: Max loss per trade
-    if setup.get("max_loss", 0) > MAX_POSITION_SIZE:
-        return False, f"Setup max loss ${setup['max_loss']:.0f} exceeds limit ${MAX_POSITION_SIZE:.0f}"
-
-    # Check 4: Don't trade same symbol twice
-    open_symbols = [p["symbol"] for p in positions]
-    if setup["symbol"] in open_symbols:
-        return False, f"Already have an open position in {setup['symbol']}"
-
-    # Check 5: Remaining daily budget
-    remaining_budget = DAILY_LOSS_LIMIT - abs(min(stats["pnl"], 0))
-    if setup.get("max_loss", 0) > remaining_budget:
-        return False, f"Trade max loss ${setup['max_loss']:.0f} exceeds remaining daily budget ${remaining_budget:.0f}"
-
-    return True, "All risk checks passed"
+    import risk_manager
+    return risk_manager.check_all_risk(setup)
 
 
 # ── Order Building ─────────────────────────────────────────────────────────────
@@ -618,6 +576,25 @@ def check_exits(brain) -> int:
     positions = _load_positions()
     closed = 0
 
+    # Read the CURRENT protection state once per cycle — this used to be
+    # computed (tightened stop under RESTRICT/REDUCE_HALF) but never
+    # actually reach this function, which hardcoded a flat 75% stop
+    # regardless of protection level. Also carries the "was up 5%, now
+    # below 2%" drawback flag, which used to only log a message.
+    protection = profit_protection.get_protection_status()
+    stop_frac = protection.get("stop_level", 0.75)
+
+    if protection.get("drawback_alert"):
+        for position in positions:
+            close_position(position, "Profit drawback protection — closing all positions")
+            closed += 1
+        if closed:
+            alerts.risk_warning(
+                f"🚨 Drawback protection closed {closed} position(s): "
+                f"was up ${protection['peak_daily_pnl']:.2f}, now ${protection['daily_pnl']:.2f}"
+            )
+        return closed
+
     for position in positions:
         pnl = get_position_pnl(position)
         max_loss = position.get("max_loss", 150)
@@ -638,7 +615,7 @@ def check_exits(brain) -> int:
             closed += 1
             continue
 
-        if pnl <= -(max_loss * 0.75):
+        if pnl <= -(max_loss * stop_frac):
             close_position(position, f"Stop loss hit ({pnl_pct:.0f}%)")
             closed += 1
             continue

@@ -263,6 +263,13 @@ def scan_and_trade():
     """
     try:
         _scan_and_trade_inner()
+        # Refresh regardless of whether this cycle actually did anything
+        # (market closed / paused are legitimate no-ops) — the point of
+        # this timestamp is purely "the scan loop itself is still alive
+        # and completing," which health_check() below alerts on if it
+        # goes stale. Distinct from logs/heartbeat.txt, which only proves
+        # the process is running, not that scanning is actually working.
+        Path("logs/last_successful_scan.txt").write_text(str(time.time()))
     except BrokenPipeError:
         pass  # systemd pipe closed — safe to ignore
     except Exception as e:
@@ -667,8 +674,28 @@ def end_of_day():
 
 def health_check():
     """Write heartbeat every 5 min so dashboard stays Online."""
-    from pathlib import Path
     Path("logs/heartbeat.txt").write_text(str(time.time()))
+
+    # heartbeat.txt only proves the process is alive — a bot that's thrown
+    # an exception on every scan for six hours still writes this file and
+    # still shows "Online, green" on the dashboard. Cross-check against
+    # last_successful_scan.txt (written by scan_and_trade() above) so a
+    # scan loop that's stopped actually completing gets flagged instead of
+    # silently looking identical to "market's just quiet today."
+    scan_marker = Path("logs/last_successful_scan.txt")
+    stale_after_sec = SCAN_INTERVAL_MINUTES * 60 * 3
+    if scan_marker.exists():
+        try:
+            age_sec = time.time() - float(scan_marker.read_text())
+            if age_sec > stale_after_sec:
+                alerts.degraded("scan_loop",
+                                 f"No successful scan cycle in {age_sec/60:.0f} min "
+                                 f"(expected every {SCAN_INTERVAL_MINUTES} min) — "
+                                 f"process is alive but scanning may be stuck/erroring",
+                                 cooldown_minutes=30)
+        except Exception:
+            pass
+
     open_pos   = executor.get_open_positions()
     stats      = executor.get_daily_stats()
     risk       = get_risk_summary()
@@ -712,23 +739,39 @@ def main():
 
     # Authenticate
     print("Authenticating with Tastytrade...")
-    try:
-        auth.initialize()
-        if not auth.is_authenticated():
-            print("Auth failed: no valid token. Update TASTY_REFRESH_TOKEN in .env and restart.")
-            # Keep bot alive so heartbeat continues and dashboard stays Online
-            # Retry auth every 5 minutes
-            while not auth.is_authenticated():
-                print("Retrying auth in 5 minutes...")
-                time.sleep(300)
-                auth.initialize()
-        print(f"Authenticated. Account: {auth.session.account_number}")
-    except Exception as e:
-        print(f"Auth failed: {e}")
-        print("Retrying in 5 minutes...")
-        time.sleep(300)
-        main()  # restart
-        return
+    while True:
+        try:
+            auth.initialize()
+            if not auth.is_authenticated():
+                print("Auth failed: no valid token. Update TASTY_REFRESH_TOKEN in .env and restart.")
+                # This used to keep the process alive so the dashboard's
+                # heartbeat still reported "online" — true, but silently:
+                # no alert was ever sent, so a broken refresh token could
+                # sit unnoticed for days while zero trades were placed.
+                # Now it alerts once immediately, then again on a cooldown
+                # for as long as auth stays broken.
+                alerts.error("startup_auth", Exception(
+                    "No valid Tastytrade token — bot process is alive but cannot "
+                    "authenticate, trade, or see real positions until "
+                    "TASTY_REFRESH_TOKEN is fixed in .env."
+                ))
+                while not auth.is_authenticated():
+                    print("Retrying auth in 5 minutes...")
+                    time.sleep(300)
+                    auth.initialize()
+                    if not auth.is_authenticated():
+                        alerts.degraded("tastytrade_auth", "Still no valid token after retry", cooldown_minutes=30)
+            print(f"Authenticated. Account: {auth.session.account_number}")
+            break
+        except Exception as e:
+            print(f"Auth failed: {e}")
+            alerts.degraded("tastytrade_auth", f"Auth raised an exception: {e}", cooldown_minutes=30)
+            print("Retrying in 5 minutes...")
+            time.sleep(300)
+            # Loop back and retry — this used to recurse into main() again,
+            # growing the call stack by one frame per retry (and re-sending
+            # bot_started()) until a long enough outage caused a
+            # RecursionError and killed the process outright.
 
     mode = os.environ.get("TRADING_MODE", "sandbox").upper()
     print(f"Mode: {mode}")

@@ -64,14 +64,50 @@ def _load_journal() -> list:
 
 # ── Performance Metrics ────────────────────────────────────────────────────────
 
+def _normalize_strategy_key(display_name: str) -> str:
+    """
+    Map a trade's free-text strategy display name (e.g. "Bull Put Credit
+    Spread", "0DTE C Scalp (Bullish)", "Iron Condor") to the canonical,
+    underscored key used everywhere else in the risk/ML pipeline
+    (credit_spread, 0dte_scalp, iron_condor, spread, strangle, long_option).
+
+    This used to be inlined separately in two places: here (implicitly, via
+    a raw `.find(canonical_key)` substring search against the display name)
+    and in compute_all_strategy_stats (a real if/elif classifier against the
+    display name). The two never agreed — "iron condor".find("iron_condor")
+    is -1 because of the underscore, so compute_strategy_stats("iron_condor")
+    always returned zero trades no matter how many were actually traded.
+    Same for credit_spread, 0dte_scalp, and long_option; and "spread" as a
+    canonical key also happened to substring-match credit spread trades,
+    so a losing credit-spread streak could end up disabling debit spreads
+    instead. Both call sites now go through this single classifier so a
+    trade is always bucketed the same way it's later looked up.
+    """
+    s = (display_name or "").lower()
+    if "condor" in s:
+        return "iron_condor"
+    if "credit" in s or "bull put" in s or "bear call" in s:
+        return "credit_spread"
+    if "spread" in s:
+        return "spread"
+    if "0dte" in s or "scalp" in s:
+        return "0dte_scalp"
+    if "strangle" in s:
+        return "strangle"
+    if "long" in s:
+        return "long_option"
+    return "unknown"
+
+
 def compute_strategy_stats(trades: list, strategy: str = None) -> dict:
     """
     Compute comprehensive performance statistics for a set of trades.
-    Optional: filter by strategy type.
+    Optional: filter by strategy type (a canonical key like "credit_spread",
+    matched via _normalize_strategy_key — not a raw substring search).
     """
     filtered = [t for t in trades if t.get("pnl") is not None]
     if strategy:
-        filtered = [t for t in filtered if t.get("strategy", "").lower().find(strategy.lower()) != -1]
+        filtered = [t for t in filtered if _normalize_strategy_key(t.get("strategy", "")) == strategy.lower()]
 
     if not filtered:
         return {"trades": 0, "win_rate": 0, "profit_factor": 0, "sharpe": 0,
@@ -130,22 +166,8 @@ def compute_strategy_stats(trades: list, strategy: str = None) -> dict:
 
 def compute_all_strategy_stats(trades: list) -> dict:
     """Compute performance stats broken down by strategy type."""
-    strategies = set()
-    for t in trades:
-        strat = t.get("strategy", "unknown")
-        # Normalize strategy names
-        if "condor" in strat.lower():
-            strategies.add("iron_condor")
-        elif "credit" in strat.lower() or "bull put" in strat.lower() or "bear call" in strat.lower():
-            strategies.add("credit_spread")
-        elif "spread" in strat.lower():
-            strategies.add("spread")
-        elif "0dte" in strat.lower() or "scalp" in strat.lower():
-            strategies.add("0dte_scalp")
-        elif "strangle" in strat.lower():
-            strategies.add("strangle")
-        elif "long" in strat.lower():
-            strategies.add("long_option")
+    strategies = {_normalize_strategy_key(t.get("strategy", "unknown")) for t in trades}
+    strategies.discard("unknown")
 
     result = {"overall": compute_strategy_stats(trades)}
     for strat in strategies:
@@ -194,7 +216,8 @@ def _compute_optimal_weights(strategy_stats: dict) -> dict:
 def _should_disable_strategy(stats: dict) -> list:
     """
     Return list of strategies that should be disabled based on performance.
-    Criteria: Sharpe < 0 over last 20 trades with at least 10 trades.
+    Criteria (all-time stats, not a rolling window): at least 10 trades,
+    Sharpe < 0, AND win rate < 35%.
     """
     disabled = []
     for strat, s in stats.items():

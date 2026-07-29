@@ -16,9 +16,14 @@ Output: Sentiment Score (0-100) + event flags for Claude context.
 import os
 import time
 import json
+import logging
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
+
+import alerts
+
+log = logging.getLogger("sentiment")
 
 try:
     import yfinance as yf
@@ -223,7 +228,15 @@ Respond with ONLY valid JSON:
         _save_cache(cache)
         return result
     except Exception as e:
-        pass  # Sentiment API returned empty — silently use neutral fallback
+        # This used to be a bare `pass` — a dead/rate-limited Anthropic key
+        # would turn sentiment into a permanent, silent neutral 50 with no
+        # log line and no alert anywhere, indistinguishable from a
+        # genuinely neutral read (and this feeds 12% of composite
+        # confidence). Now it's logged and alerted (rate-limited to once/hr
+        # per the alerts.degraded() cooldown) so a dead key doesn't sit
+        # unnoticed indefinitely.
+        log.error(f"sentiment: Claude scoring failed for {symbol}: {e}")
+        alerts.degraded("sentiment_llm", f"Claude sentiment scoring failed: {e}")
         return {"score": 50, "sentiment": "NEUTRAL", "key_theme": "Unable to score", "risk_flags": []}
 
 
