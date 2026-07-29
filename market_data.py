@@ -17,8 +17,14 @@ import statistics
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from auth import session
+import options_pricing
 
-# ── yfinance for market data (Tastytrade sandbox doesn't serve quotes) ─────────
+# ── yfinance for quotes/chains — this account's Tastytrade API access is
+# real (api.tastytrade.com, not a cert/sandbox environment; DXLink
+# real-time streaming is available), but the chain-fetch path here still
+# goes through yfinance for now. Greeks are no longer hardcoded, though —
+# see options_pricing.py — they're computed via Black-Scholes from each
+# contract's own strike/spot/DTE/IV, which yfinance does provide.
 try:
     import yfinance as yf
     _YF_AVAILABLE = True
@@ -47,14 +53,82 @@ WATCHLIST = get_watchlist()
 
 # ── Quotes ─────────────────────────────────────────────────────────────────────
 def get_quote(symbol: str) -> dict:
-    """Get quote via yfinance (primary) — works in sandbox and live."""
-    if _YF_AVAILABLE:
-        return _get_quote_yfinance(symbol)
-    return _get_quote_tastytrade(symbol)
+    """
+    Live price/bid/ask/volume — Tastytrade's own real-time quote feed
+    first (real NBBO bid/ask from the broker), yfinance as fallback only
+    if Tastytrade is unavailable. This used to be the other way around,
+    and the yfinance path fabricated bid/ask as price ± $0.01 — a
+    synthetic 2-cent spread with no relationship to the real market. Real
+    Tastytrade SPY spreads observed during verification were ~2 cents too,
+    but genuinely quoted, not invented.
+
+    IV/IV-rank always come from the yfinance-based calculation below
+    regardless of which source won the price — Tastytrade's REST snapshot
+    endpoint (/market-data/by-type) doesn't expose those fields; getting
+    real per-contract IV/Greeks from Tastytrade requires the DXLink
+    streaming feed, which is a separate, larger integration (see
+    options_pricing.py for the Black-Scholes Greeks used in the meantime).
+    """
+    q = _get_quote_tastytrade(symbol)
+    if not q and _YF_AVAILABLE:
+        q = _get_quote_yfinance_price(symbol)
+    if not q:
+        return None
+    iv, iv_rank = _compute_iv_and_rank(symbol, q["price"])
+    q["iv"] = iv
+    q["iv_rank"] = iv_rank
+    return q
 
 
-def _get_quote_yfinance(symbol: str) -> dict:
-    """Fetch real-time quote from yfinance."""
+def _compute_iv_and_rank(symbol: str, price: float) -> tuple:
+    """
+    Best-effort IV + IV-rank via yfinance's option chain and a 1yr
+    realized-vol distribution. Split out from quote fetching so it's
+    reused no matter which source (Tastytrade or yfinance) provided the
+    actual price — Tastytrade's REST quote endpoint doesn't return IV.
+    """
+    iv_rank = 50.0
+    iv = 0.25
+    if not _YF_AVAILABLE or price <= 0:
+        return iv, iv_rank
+    try:
+        ticker = yf.Ticker(symbol)
+        opts = ticker.options
+        if opts:
+            exp = opts[0]
+            chain = ticker.option_chain(exp)
+            atm_calls = chain.calls
+            atm_calls = atm_calls[abs(atm_calls["strike"] - price) < price * 0.05]
+            if not atm_calls.empty:
+                iv = float(atm_calls["impliedVolatility"].mean())
+
+        # Compute 52-week IV rank via rolling HV distribution
+        hist_1y = ticker.history(period="1y", interval="1d", auto_adjust=True)
+        if hist_1y is not None and len(hist_1y) >= 60:
+            log_ret = (hist_1y["Close"] / hist_1y["Close"].shift(1)).apply(
+                lambda x: x if x > 0 else float("nan")
+            ).apply(float).pipe(lambda s: s.map(lambda x: __import__("math").log(x) if x > 0 else float("nan")))
+            # 21-day rolling realized vol → annualized
+            rv_series = log_ret.rolling(21).std() * (252 ** 0.5)
+            rv_series = rv_series.dropna()
+            if len(rv_series) >= 20:
+                rv_min  = float(rv_series.quantile(0.05))
+                rv_max  = float(rv_series.quantile(0.95))
+                if rv_max > rv_min:
+                    iv_rank = round((iv - rv_min) / (rv_max - rv_min) * 100, 1)
+                    iv_rank = max(0.0, min(100.0, iv_rank))
+                else:
+                    iv_rank = 50.0
+    except Exception:
+        pass
+    return iv, iv_rank
+
+
+def _get_quote_yfinance_price(symbol: str) -> dict:
+    """Fallback price/bid/ask/volume from yfinance, used only if
+    Tastytrade's own quote feed is unavailable. Still fabricates a
+    synthetic 2-cent spread (yfinance doesn't provide real bid/ask for
+    equities) — this is now the fallback case, not the default."""
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.fast_info
@@ -63,41 +137,6 @@ def _get_quote_yfinance(symbol: str) -> dict:
         prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else price
         change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
         volume = int(info.three_month_average_volume or info.last_volume or 0)
-
-        # IV rank: (current IV - 52wk min) / (52wk max - 52wk min) * 100
-        # Uses rolling 21-day historical volatility as IV proxy over 1 year
-        iv_rank = 50.0
-        iv = 0.25
-        try:
-            opts = ticker.options
-            if opts:
-                exp = opts[0]
-                chain = ticker.option_chain(exp)
-                atm_calls = chain.calls
-                atm_calls = atm_calls[abs(atm_calls["strike"] - price) < price * 0.05]
-                if not atm_calls.empty:
-                    iv = float(atm_calls["impliedVolatility"].mean())
-
-            # Compute 52-week IV rank via rolling HV distribution
-            hist_1y = ticker.history(period="1y", interval="1d", auto_adjust=True)
-            if hist_1y is not None and len(hist_1y) >= 60:
-                log_ret = (hist_1y["Close"] / hist_1y["Close"].shift(1)).apply(
-                    lambda x: x if x > 0 else float("nan")
-                ).apply(float).pipe(lambda s: s.map(lambda x: __import__("math").log(x) if x > 0 else float("nan")))
-                # 21-day rolling realized vol → annualized
-                rv_series = log_ret.rolling(21).std() * (252 ** 0.5)
-                rv_series = rv_series.dropna()
-                if len(rv_series) >= 20:
-                    rv_min  = float(rv_series.quantile(0.05))
-                    rv_max  = float(rv_series.quantile(0.95))
-                    if rv_max > rv_min:
-                        iv_rank = round((iv - rv_min) / (rv_max - rv_min) * 100, 1)
-                        iv_rank = max(0.0, min(100.0, iv_rank))
-                    else:
-                        iv_rank = 50.0
-        except Exception:
-            pass
-
         return {
             "symbol": symbol,
             "price": price,
@@ -105,8 +144,6 @@ def _get_quote_yfinance(symbol: str) -> dict:
             "ask": price + 0.01,
             "mid": price,
             "volume": volume,
-            "iv": iv,
-            "iv_rank": iv_rank,
             "change_pct": round(change_pct, 2),
         }
     except Exception as e:
@@ -115,38 +152,80 @@ def _get_quote_yfinance(symbol: str) -> dict:
 
 
 def _get_quote_tastytrade(symbol: str) -> dict:
-    """Fallback: fetch quote from Tastytrade API (live mode only)."""
+    """
+    Real-time equity quote from Tastytrade's own market-data snapshot
+    endpoint. This used to call /market-data/quotes, which returns a 404
+    on this account/API version — verified live against the real account
+    before this fix (see /market-data/by-type, which does work and returns
+    real bid/ask/volume).
+    """
     try:
-        resp = session.get(
-            "/market-data/quotes",
-            params={"symbols[]": symbol}
-        )
+        resp = session.get("/market-data/by-type", params={"equity[]": symbol})
         items = resp.get("data", {}).get("items", [])
         if not items:
             return None
         q = items[0]
+        bid = float(q.get("bid", 0) or 0)
+        ask = float(q.get("ask", 0) or 0)
+        last = float(q.get("last", 0) or 0)
+        mark = float(q.get("mark", 0) or 0)
+        mid_ba = (bid + ask) / 2 if (bid or ask) else 0
+        price = last or mark or mid_ba
+        prev_close = float(q.get("prev-close", 0) or 0)
+        change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
         return {
             "symbol": symbol,
-            "price": float(q.get("last", q.get("mid", 0))),
-            "bid": float(q.get("bid", 0)),
-            "ask": float(q.get("ask", 0)),
-            "mid": (float(q.get("bid", 0)) + float(q.get("ask", 0))) / 2,
-            "volume": int(q.get("volume", 0)),
-            "iv": float(q.get("implied-volatility-index", 0)),
-            "iv_rank": float(q.get("implied-volatility-index-rank", 0)) * 100,
-            "change_pct": float(q.get("day-change-percent", 0)),
+            "price": price,
+            "bid": bid,
+            "ask": ask,
+            "mid": round((bid + ask) / 2, 4) if (bid or ask) else price,
+            "volume": int(float(q.get("volume", 0) or 0)),
+            "change_pct": round(change_pct, 2),
         }
     except Exception as e:
-        print(f"⚠️  Quote error for {symbol}: {e}")
+        print(f"⚠️  Tastytrade quote error for {symbol}: {e}")
         return None
 
 
 def get_quotes_batch(symbols: list) -> dict:
+    """
+    Batch-fetch quotes in a single Tastytrade API call instead of one
+    round-trip per symbol, falling back to per-symbol get_quote() (which
+    itself falls back to yfinance) for any symbol Tastytrade didn't
+    return.
+    """
     results = {}
+    try:
+        resp = session.get("/market-data/by-type", params={"equity[]": symbols})
+        items = resp.get("data", {}).get("items", [])
+        for q in items:
+            sym = q.get("symbol")
+            if not sym:
+                continue
+            bid = float(q.get("bid", 0) or 0)
+            ask = float(q.get("ask", 0) or 0)
+            last = float(q.get("last", 0) or 0)
+            mark = float(q.get("mark", 0) or 0)
+            mid_ba = (bid + ask) / 2 if (bid or ask) else 0
+            price = last or mark or mid_ba
+            prev_close = float(q.get("prev-close", 0) or 0)
+            change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+            iv, iv_rank = _compute_iv_and_rank(sym, price)
+            results[sym] = {
+                "symbol": sym, "price": price, "bid": bid, "ask": ask,
+                "mid": round((bid + ask) / 2, 4) if (bid or ask) else price,
+                "volume": int(float(q.get("volume", 0) or 0)),
+                "change_pct": round(change_pct, 2),
+                "iv": iv, "iv_rank": iv_rank,
+            }
+    except Exception as e:
+        print(f"⚠️  Batch quote error: {e}")
+
     for symbol in symbols:
-        q = get_quote(symbol)
-        if q:
-            results[symbol] = q
+        if symbol not in results:
+            q = get_quote(symbol)
+            if q:
+                results[symbol] = q
     return results
 
 
@@ -228,15 +307,16 @@ def _get_chain_yf(symbol: str, expiration: str, option_type: str = None) -> list
                 if mid == 0:
                     continue  # skip contracts with no pricing data
                 iv     = _safe_float(row.get("impliedVolatility", 0.25)) * 100
-                delta  = 0.5 if opt_type == "C" else -0.5
-                if price > 0 and strike > 0:
-                    moneyness = strike / price
-                    if opt_type == "C":
-                        # Call: ATM=0.5, OTM decreases, ITM increases
-                        delta = max(0.05, min(0.95, 0.5 - (moneyness - 1.0) / 0.2))
-                    else:
-                        # Put: ATM=-0.5, OTM (strike<price) approaches 0, ITM (strike>price) approaches -1
-                        delta = max(-0.95, min(-0.05, -(0.5 + (moneyness - 1.0) / 0.2)))
+                # Real Black-Scholes Greeks — this used to be a linear
+                # moneyness formula standing in for delta (no IV or
+                # time-to-expiry term at all) plus flat hardcoded constants
+                # for gamma/theta/vega (0.02 / -mid*0.01 / mid*0.1 for
+                # EVERY contract regardless of strike or expiration). Every
+                # delta-targeted strike selection and every portfolio Greek
+                # exposure check downstream was working off those fake
+                # numbers. See options_pricing.py.
+                dte_days = options_pricing.days_to_expiration(expiration)
+                greeks = options_pricing.black_scholes_greeks(price, strike, dte_days, iv, opt_type)
                 contracts.append({
                     "symbol":        f"{symbol}{expiration.replace('-','')}{opt_type}{int(strike*1000):08d}",
                     "underlying":    symbol,
@@ -248,10 +328,10 @@ def _get_chain_yf(symbol: str, expiration: str, option_type: str = None) -> list
                     "mid":           mid,
                     "volume":        _safe_int(row.get("volume", 0)),
                     "open_interest": _safe_int(row.get("openInterest", 0)),
-                    "delta":         delta,
-                    "gamma":         0.02,
-                    "theta":         -mid * 0.01,
-                    "vega":          mid * 0.1,
+                    "delta":         greeks["delta"],
+                    "gamma":         greeks["gamma"],
+                    "theta":         greeks["theta"],
+                    "vega":          greeks["vega"],
                     "iv":            iv,
                 })
 
