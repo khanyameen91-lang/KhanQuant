@@ -702,6 +702,160 @@ def api_strategy_performance():
         return jsonify({"available": False, "error": str(e)})
 
 
+@app.route("/api/data-integrity")
+def api_data_integrity():
+    """
+    Report the real status of every data source feeding trade decisions.
+
+    Every score in this system has had exactly one visual state: a number.
+    A dead API key, a rate-limited LLM, or a Black-Scholes-modeled Greek
+    all rendered as a perfectly plausible value with nothing to
+    distinguish them from a real measurement. This endpoint adds the
+    second dimension — is that number live, degraded, or modeled.
+    """
+    sources = []
+
+    # Broker session / order execution
+    try:
+        import auth
+        ok = auth.is_authenticated()
+        sources.append({
+            "name": "Tastytrade — order execution",
+            "detail": f"account {auth.session.account_number}" if ok else "not authenticated",
+            "status": "live" if ok else "down",
+        })
+    except Exception as e:
+        sources.append({"name": "Tastytrade — order execution",
+                        "detail": str(e)[:80], "status": "down"})
+
+    # Underlying quotes
+    try:
+        import market_data
+        q = market_data._get_quote_tastytrade("SPY")
+        if q and q.get("bid"):
+            sources.append({"name": "Underlying quotes",
+                            "detail": f"Tastytrade NBBO — SPY {q['bid']}/{q['ask']}",
+                            "status": "live"})
+        else:
+            sources.append({"name": "Underlying quotes",
+                            "detail": "yfinance fallback (synthetic 2c spread)",
+                            "status": "fallback"})
+    except Exception as e:
+        sources.append({"name": "Underlying quotes", "detail": str(e)[:80], "status": "down"})
+
+    # Option chain + Greeks. Honest label: the chain is real market data
+    # but the Greeks are computed, not broker-supplied.
+    sources.append({
+        "name": "Option chain & Greeks",
+        "detail": "yfinance chain + Black-Scholes Greeks (not broker-supplied)",
+        "status": "modeled",
+    })
+
+    # LLM provider — decisions and sentiment share this quota
+    try:
+        import claude_brain, sentiment
+        provider = claude_brain._llm_provider
+        if provider == "scoring":
+            sources.append({"name": "LLM decision layer",
+                            "detail": "no provider configured — pure scoring fallback",
+                            "status": "down"})
+        elif sentiment._in_llm_cooldown():
+            sources.append({"name": "LLM decision layer",
+                            "detail": f"{provider} — rate limited, sentiment paused",
+                            "status": "degraded"})
+        else:
+            sources.append({"name": "LLM decision layer",
+                            "detail": provider, "status": "live"})
+    except Exception as e:
+        sources.append({"name": "LLM decision layer", "detail": str(e)[:80], "status": "down"})
+
+    # News / macro intelligence
+    try:
+        import intelligence
+        has_key = bool(getattr(intelligence, "FINNHUB_KEY", ""))
+        sources.append({
+            "name": "News & macro intel",
+            "detail": "Finnhub" if has_key else "no API key — neutral defaults",
+            "status": "live" if has_key else "down",
+        })
+    except Exception as e:
+        sources.append({"name": "News & macro intel", "detail": str(e)[:80], "status": "down"})
+
+    # Recently-degraded subsystems, from the alert cooldown ledger
+    recent = []
+    try:
+        cd_file = LOG_DIR / "alert_cooldowns.json"
+        if cd_file.exists():
+            for name, ts in json.loads(cd_file.read_text()).items():
+                age_min = (datetime.now() - datetime.fromisoformat(ts)).total_seconds() / 60
+                if age_min < 180:
+                    recent.append({"source": name, "minutes_ago": round(age_min)})
+    except Exception:
+        pass
+
+    # Scan-loop liveness: heartbeat alone only proves the process exists.
+    scan_age_min = None
+    try:
+        marker = LOG_DIR / "last_successful_scan.txt"
+        if marker.exists():
+            scan_age_min = round((datetime.now().timestamp() - float(marker.read_text())) / 60, 1)
+    except Exception:
+        pass
+
+    return jsonify({
+        "available": True,
+        "sources": sources,
+        "recent_degradations": sorted(recent, key=lambda r: r["minutes_ago"]),
+        "last_successful_scan_min_ago": scan_age_min,
+    })
+
+
+@app.route("/api/exposure")
+def api_exposure():
+    """
+    Correlated exposure, grouped — not a flat per-symbol list.
+
+    Three open positions in three different symbols reads as diversified
+    on a naive count, but SPY + QQQ + IWM is one concentrated bet on the
+    broad market. Groups by the same sector buckets risk_manager uses to
+    gate trades, and reports beta-weighted delta alongside raw delta.
+    """
+    try:
+        import risk_manager
+        positions = load_positions()
+        greeks = risk_manager.get_portfolio_greeks()
+
+        groups = {}
+        for p in positions:
+            sym = p.get("symbol", "?")
+            sector = risk_manager._SECTOR_MAP.get(sym, "OTHER")
+            g = groups.setdefault(sector, {"sector": sector, "symbols": [],
+                                            "count": 0, "max_loss": 0.0})
+            g["symbols"].append(sym)
+            g["count"] += 1
+            g["max_loss"] += float(p.get("max_loss", 0) or 0)
+
+        # 2 positions per sector is risk_manager's concentration limit
+        for g in groups.values():
+            g["limit"] = 2
+            g["used_pct"] = round(min(g["count"] / 2 * 100, 100), 1)
+            g["betas"] = {s: risk_manager.get_beta(s) for s in g["symbols"]}
+
+        max_delta = risk_manager.MAX_PORTFOLIO_DELTA
+        bwd = greeks.get("beta_weighted_delta", 0.0)
+        return jsonify({
+            "available": True,
+            "groups": sorted(groups.values(), key=lambda g: -g["count"]),
+            "net_delta": greeks.get("net_delta", 0.0),
+            "beta_weighted_delta": bwd,
+            "max_portfolio_delta": max_delta,
+            "beta_weighted_used_pct": round(min(abs(bwd) / max_delta * 100, 100), 1) if max_delta else 0,
+            "open_positions": len(positions),
+        })
+    except Exception as e:
+        return jsonify({"available": False, "error": str(e)})
+
+
 # ── Action endpoints ───────────────────────────────────────────────────────────
 
 @app.route("/api/force-scan", methods=["POST"])

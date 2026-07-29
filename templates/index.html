@@ -255,6 +255,7 @@
   <button class="tab-btn" onclick="switchTab('performance',this)">📈 Performance</button>
   <button class="tab-btn" onclick="switchTab('positions',this)">💼 Positions</button>
   <button class="tab-btn" onclick="switchTab('journal',this)">📓 Journal</button>
+  <button class="tab-btn" onclick="switchTab('health',this)">🩺 System Health</button>
   <button class="tab-btn" onclick="switchTab('settings',this)">⚙️ Settings</button>
   <button class="tab-btn" onclick="switchTab('log',this)">🖥️ Log</button>
 </nav>
@@ -513,6 +514,37 @@
 </div>
 
 <!-- SETTINGS -->
+<!-- SYSTEM HEALTH -->
+<div id="tab-health" class="tab-pane">
+  <div class="grid grid-2" style="margin-bottom:14px;">
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between;">
+        <span>🩺 Data Sources</span>
+        <span style="font-size:11px;color:var(--muted);" id="health-scan-age">—</span>
+      </div>
+      <div id="health-sources"><div class="empty">Loading…</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔗 Correlated Exposure</div>
+      <div class="risk-meter">
+        <div class="lbl"><span>Beta-weighted delta</span><span id="exp-bwd">—</span></div>
+        <div class="bar-wrap"><div class="bar-fill bar-green" id="exp-bwd-bar" style="width:0%"></div></div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin:8px 0 10px;">
+        Raw delta: <strong id="exp-raw-delta" style="color:var(--text);">—</strong>
+        &nbsp;·&nbsp; Positions in correlated groups count once, not separately.
+      </div>
+      <div id="exp-groups"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">⚠️ Recent Degradations (last 3h)</div>
+    <div id="health-degradations"><div class="empty">None</div></div>
+  </div>
+</div>
+
 <div id="tab-settings" class="tab-pane">
   <div class="settings-section">
     <h3>Watchlist</h3>
@@ -581,6 +613,87 @@ function switchTab(name, btn) {
   currentTab = name;
   if (name === 'performance') loadPerformance();
   if (name === 'intel-news') fetch('/api/intel').then(r=>r.json()).then(d=>updateIntelPanel(d)).catch(()=>{});
+  if (name === 'health') loadHealth();
+}
+
+// ── System Health panel ──────────────────────────────────────────────────────
+
+const STATUS_BADGE = {
+  live:     ['badge-green',  'Live'],
+  modeled:  ['badge-blue',   'Modeled'],
+  fallback: ['badge-yellow', 'Fallback'],
+  degraded: ['badge-yellow', 'Degraded'],
+  down:     ['badge-red',    'Down'],
+};
+
+async function loadHealth() {
+  try {
+    const [di, exp] = await Promise.all([
+      fetch('/api/data-integrity').then(r=>r.json()),
+      fetch('/api/exposure').then(r=>r.json()),
+    ]);
+    renderDataIntegrity(di);
+    renderExposure(exp);
+  } catch(e) { console.error('Health load error:', e); }
+}
+
+function renderDataIntegrity(d) {
+  if (!d || !d.available) return;
+  const el = document.getElementById('health-sources');
+  el.innerHTML = (d.sources||[]).map(s => {
+    const [cls, label] = STATUS_BADGE[s.status] || ['badge-gray', s.status];
+    return `<div class="ml-stat">
+      <div>
+        <div style="font-size:13px;font-weight:600;">${s.name}</div>
+        <div style="font-size:11px;color:var(--muted);font-family:var(--font-mono);">${s.detail||''}</div>
+      </div>
+      <span class="badge ${cls}">${label}</span>
+    </div>`;
+  }).join('');
+
+  const age = d.last_successful_scan_min_ago;
+  const ageEl = document.getElementById('health-scan-age');
+  if (age == null) { ageEl.textContent = 'no scan recorded'; ageEl.style.color = 'var(--yellow)'; }
+  else {
+    ageEl.textContent = `last scan ${age}m ago`;
+    ageEl.style.color = age > 6 ? 'var(--red)' : 'var(--muted)';
+  }
+
+  const dg = document.getElementById('health-degradations');
+  const items = d.recent_degradations || [];
+  dg.innerHTML = items.length
+    ? items.map(x => `<div class="ml-stat">
+        <span class="ms-lbl" style="font-family:var(--font-mono);">${x.source}</span>
+        <span class="ms-val" style="color:var(--yellow);">${x.minutes_ago}m ago</span>
+      </div>`).join('')
+    : '<div class="empty">None — all subsystems reporting normally</div>';
+}
+
+function renderExposure(d) {
+  if (!d || !d.available) return;
+  document.getElementById('exp-raw-delta').textContent = (d.net_delta ?? 0).toFixed(1);
+  document.getElementById('exp-bwd').textContent =
+    `${(d.beta_weighted_delta ?? 0).toFixed(1)} / ${d.max_portfolio_delta}`;
+  const pct = d.beta_weighted_used_pct || 0;
+  const bar = document.getElementById('exp-bwd-bar');
+  bar.style.width = clamp(pct, 0, 100) + '%';
+  bar.className = 'bar-fill ' + (pct > 75 ? 'bar-red' : pct > 40 ? 'bar-yellow' : 'bar-green');
+
+  const el = document.getElementById('exp-groups');
+  const groups = d.groups || [];
+  if (!groups.length) { el.innerHTML = '<div class="empty">No open positions</div>'; return; }
+  el.innerHTML = groups.map(g => {
+    const color = g.used_pct >= 100 ? 'var(--red)' : g.used_pct > 50 ? 'var(--yellow)' : 'var(--green)';
+    const syms = g.symbols.map(s => `${s} <span style="color:var(--muted);">β${(g.betas[s]||1).toFixed(2)}</span>`).join(' · ');
+    return `<div class="regime-item" style="margin-bottom:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;">
+        <span style="font-size:12px;font-weight:600;">${g.sector}</span>
+        <span style="font-size:11px;color:${color};font-family:var(--font-mono);">${g.count}/${g.limit} slots</span>
+      </div>
+      <div style="font-size:11px;font-family:var(--font-mono);margin:4px 0 6px;">${syms}</div>
+      <div class="bar-wrap"><div class="bar-fill" style="width:${clamp(g.used_pct,0,100)}%;background:${color};"></div></div>
+    </div>`;
+  }).join('');
 }
 
 function initChart(labels, data) {
@@ -1160,6 +1273,7 @@ async function refresh() {
     }
     if (d.intel) updateIntelPanel(d.intel);
     if (currentTab === 'performance') loadPerformance();
+    if (currentTab === 'health') loadHealth();
     if (currentTab === 'intel-news') updateIntelPanel(d.intel);
   } catch(e) {
     console.error('Refresh error:', e);
