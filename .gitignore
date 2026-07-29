@@ -1,0 +1,34 @@
+# Secrets & credentials
+.env
+*.key
+*.pem
+*.p12
+setup_github.sh
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Runtime data
+logs/
+*.log
+News/
+Performance/
+
+# Windows artifacts
+cloudflared.exe
+*.bat
+*.vbs
+
+# Local dev notes
+BRIEFING.md
+COWORK_PROMPT.md
+SYSTEM_AUDIT.md
+
+# Misc
+.DS_Store
+Thumbs.db
+.oauth_token.json

@@ -1,0 +1,21 @@
+# Tasty Bot v2 — Python Dependencies
+
+# Core / Tastytrade API
+requests>=2.31.0
+python-dotenv>=1.0.0
+anthropic>=0.105.0
+schedule>=1.2.1
+flask>=3.0.0
+
+# Market data & technical analysis (NEW)
+yfinance>=0.2.36
+pandas>=2.0.0
+pandas-ta>=0.3.14b
+numpy>=1.24.0
+
+# Machine learning (NEW)
+scikit-learn>=1.4.0
+
+# Utilities
+python-dateutil>=2.8.0
+pytz>=2024.1
