@@ -715,9 +715,71 @@ def end_of_day():
         print(f"ML retrain error: {e}")
 
 
+def write_health_status():
+    """
+    Publish data-source health to logs/health_status.json for the
+    dashboard to read.
+
+    The dashboard used to determine this itself by importing sentiment /
+    claude_brain / market_data inside its request handler. Those pull in
+    yfinance, pandas and numpy, which ballooned the dashboard process
+    from ~46MB to ~400MB — and on this 956MB instance with no swap, the
+    OOM killer took it out seven times. The bot already has all of these
+    modules resident, so it is both cheaper and more authoritative for it
+    to publish status here and let the dashboard just read a small file.
+    """
+    sources = []
+    try:
+        provider = claude_brain._llm_provider
+        cooling = False
+        try:
+            import sentiment as _s
+            cooling = _s._in_llm_cooldown()
+        except Exception:
+            pass
+        if provider == "scoring":
+            sources.append({"name": "LLM decision layer",
+                            "detail": "no provider configured — pure scoring fallback",
+                            "status": "down"})
+        elif cooling:
+            sources.append({"name": "LLM decision layer",
+                            "detail": f"{provider} — rate limited, sentiment paused",
+                            "status": "degraded"})
+        else:
+            sources.append({"name": "LLM decision layer",
+                            "detail": provider, "status": "live"})
+    except Exception as e:
+        sources.append({"name": "LLM decision layer", "detail": str(e)[:80], "status": "down"})
+
+    try:
+        import intelligence
+        has_key = bool(getattr(intelligence, "FINNHUB_KEY", ""))
+        sources.append({"name": "News & macro intel",
+                        "detail": "Finnhub" if has_key else "no API key — neutral defaults",
+                        "status": "live" if has_key else "down"})
+    except Exception as e:
+        sources.append({"name": "News & macro intel", "detail": str(e)[:80], "status": "down"})
+
+    sources.append({"name": "Option chain & Greeks",
+                    "detail": "yfinance chain + Black-Scholes Greeks (not broker-supplied)",
+                    "status": "modeled"})
+    sources.append({"name": "Underlying quotes",
+                    "detail": "Tastytrade NBBO (yfinance fallback if unavailable)",
+                    "status": "live"})
+
+    try:
+        state_store.atomic_write_json(
+            Path("logs/health_status.json"),
+            {"updated_at": datetime.now().isoformat(), "sources": sources},
+        )
+    except Exception as e:
+        print(f"health status write error: {e}")
+
+
 def health_check():
     """Write heartbeat every 5 min so dashboard stays Online."""
     Path("logs/heartbeat.txt").write_text(str(time.time()))
+    write_health_status()
 
     # heartbeat.txt only proves the process is alive — a bot that's thrown
     # an exception on every scan for six hours still writes this file and

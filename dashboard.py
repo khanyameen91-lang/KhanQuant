@@ -690,14 +690,33 @@ def api_equity_curve():
 
 @app.route("/api/strategy-performance")
 def api_strategy_performance():
-    """Return per-strategy performance breakdown."""
+    """
+    Per-strategy performance breakdown, read from the stats file the
+    bot's nightly retrain already writes.
+
+    This used to `from ml_engine import compute_all_strategy_stats`,
+    which drags numpy, pandas and scikit-learn into the dashboard
+    process. On this 956MB instance with no swap that pushed the
+    dashboard past the OOM threshold and got it killed. ml_engine's
+    nightly_retrain() already persists exactly these numbers to
+    logs/ml_stats.json, so read that instead of recomputing them in the
+    web process.
+    """
     try:
-        from ml_engine import compute_all_strategy_stats, _load_journal
-        trades = _load_journal()
-        if not trades:
+        stats_file = LOG_DIR / "ml_stats.json"
+        if not stats_file.exists():
+            return jsonify({"available": False,
+                            "message": "No stats yet — runs after the nightly retrain"})
+        data = json.loads(stats_file.read_text())
+        strategies = data.get("strategy_stats", {})
+        if not strategies:
             return jsonify({"available": False, "message": "No trades yet"})
-        stats = compute_all_strategy_stats(trades)
-        return jsonify({"available": True, "strategies": stats})
+        return jsonify({
+            "available": True,
+            "strategies": strategies,
+            "disabled_strategies": data.get("disabled_strategies", []),
+            "last_retrain": data.get("last_retrain"),
+        })
     except Exception as e:
         return jsonify({"available": False, "error": str(e)})
 
@@ -752,50 +771,32 @@ def api_data_integrity():
         sources.append({"name": "Tastytrade — order execution",
                         "detail": str(e)[:80], "status": "down"})
 
-    # Underlying quotes — report the configured source, not a live probe.
-    sources.append({
-        "name": "Underlying quotes",
-        "detail": "Tastytrade NBBO (yfinance fallback if unavailable)",
-        "status": "live",
-    })
-
-    # Option chain + Greeks. Honest label: the chain is real market data
-    # but the Greeks are computed, not broker-supplied.
-    sources.append({
-        "name": "Option chain & Greeks",
-        "detail": "yfinance chain + Black-Scholes Greeks (not broker-supplied)",
-        "status": "modeled",
-    })
-
-    # LLM provider — decisions and sentiment share this quota
+    # Everything else — LLM provider, news intel, quote/chain sourcing —
+    # is published by the BOT process into logs/health_status.json (see
+    # bot.write_health_status).
+    #
+    # This endpoint previously determined those itself by importing
+    # sentiment / claude_brain / market_data inline. Those pull in
+    # yfinance, pandas and numpy, which grew the dashboard process from
+    # ~46MB to ~400MB; on this 956MB instance with no swap the OOM killer
+    # took the dashboard down seven times. Never import a heavyweight
+    # analysis module in a dashboard request handler — read what the bot
+    # already computed instead.
     try:
-        import claude_brain, sentiment
-        provider = claude_brain._llm_provider
-        if provider == "scoring":
-            sources.append({"name": "LLM decision layer",
-                            "detail": "no provider configured — pure scoring fallback",
-                            "status": "down"})
-        elif sentiment._in_llm_cooldown():
-            sources.append({"name": "LLM decision layer",
-                            "detail": f"{provider} — rate limited, sentiment paused",
-                            "status": "degraded"})
+        hs_file = LOG_DIR / "health_status.json"
+        if hs_file.exists():
+            hs = json.loads(hs_file.read_text())
+            sources.extend(hs.get("sources", []))
+            published_at = hs.get("updated_at")
         else:
-            sources.append({"name": "LLM decision layer",
-                            "detail": provider, "status": "live"})
+            published_at = None
+            sources.append({"name": "Bot-published status",
+                            "detail": "no health_status.json yet — bot may not have run a cycle",
+                            "status": "degraded"})
     except Exception as e:
-        sources.append({"name": "LLM decision layer", "detail": str(e)[:80], "status": "down"})
-
-    # News / macro intelligence
-    try:
-        import intelligence
-        has_key = bool(getattr(intelligence, "FINNHUB_KEY", ""))
-        sources.append({
-            "name": "News & macro intel",
-            "detail": "Finnhub" if has_key else "no API key — neutral defaults",
-            "status": "live" if has_key else "down",
-        })
-    except Exception as e:
-        sources.append({"name": "News & macro intel", "detail": str(e)[:80], "status": "down"})
+        published_at = None
+        sources.append({"name": "Bot-published status",
+                        "detail": str(e)[:80], "status": "down"})
 
     # Recently-degraded subsystems, from the alert cooldown ledger
     recent = []
