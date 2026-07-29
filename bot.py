@@ -768,6 +768,7 @@ def write_health_status():
                     "status": "live"})
 
     try:
+        import state_store
         state_store.atomic_write_json(
             Path("logs/health_status.json"),
             {"updated_at": datetime.now().isoformat(), "sources": sources},
