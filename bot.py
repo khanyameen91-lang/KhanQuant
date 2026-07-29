@@ -703,7 +703,7 @@ def main():
     print("   Broker: Tastytrade | Brain: Claude AI + ML")
     print("=" * 55)
 
-    required = ["TASTY_USERNAME", "TASTY_PASSWORD", "ANTHROPIC_API_KEY",
+    required = ["TASTY_USERNAME", "TASTY_PASSWORD",
                 "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
