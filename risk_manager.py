@@ -33,15 +33,27 @@ MAX_DRAWDOWN_PCT       = float(os.environ.get("MAX_DRAWDOWN_PCT", 5.0))    # % o
 ACCOUNT_SIZE           = float(os.environ.get("ACCOUNT_SIZE", 5000))
 MONTHLY_LOSS_LIMIT     = float(os.environ.get("MONTHLY_LOSS_LIMIT", 1200)) # 2× weekly limit
 
-# Per-strategy monthly drawdown limits (max loss per strategy in a calendar month)
+# Per-strategy monthly drawdown limits, as a FRACTION of ACCOUNT_SIZE.
+#
+# These used to be hardcoded dollar amounts ($300-$500) calibrated for a
+# $5,000 account. On a smaller account they silently became meaningless —
+# at $500, a "$500 monthly limit" for credit spreads is the entire
+# account, so the check could never fire. Expressing them as fractions
+# means they stay meaningful at any account size and rescale
+# automatically as the balance grows, instead of quietly decaying into
+# no-ops the way absolute dollars do.
+STRATEGY_MONTHLY_LIMIT_PCT = {
+    "long_option":   0.06,   # High-risk/high-reward, limit exposure
+    "0dte_scalp":    0.08,   # Most volatile, tighter limit
+    "credit_spread": 0.10,   # Defined risk, more room
+    "spread":        0.08,
+    "iron_condor":   0.10,
+    "strangle":      0.06,
+    "default":       0.08,
+}
+
 STRATEGY_MONTHLY_LIMITS = {
-    "long_option":   300.0,   # High-risk/high-reward, limit exposure
-    "0dte_scalp":    400.0,   # Most volatile, tighter limit
-    "credit_spread": 500.0,   # Defined risk, more room
-    "spread":        400.0,
-    "iron_condor":   500.0,
-    "strangle":      300.0,
-    "default":       400.0,
+    k: round(ACCOUNT_SIZE * pct, 2) for k, pct in STRATEGY_MONTHLY_LIMIT_PCT.items()
 }
 
 # Max concurrent positions per strategy type
