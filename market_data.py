@@ -18,6 +18,7 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from auth import session
 import options_pricing
+import dxlink_stream
 
 # ── yfinance for quotes/chains — this account's Tastytrade API access is
 # real (api.tastytrade.com, not a cert/sandbox environment; DXLink
@@ -317,7 +318,7 @@ def _get_chain_yf(symbol: str, expiration: str, option_type: str = None) -> list
                 # numbers. See options_pricing.py.
                 dte_days = options_pricing.days_to_expiration(expiration)
                 greeks = options_pricing.black_scholes_greeks(price, strike, dte_days, iv, opt_type)
-                contracts.append({
+                contract = {
                     "symbol":        f"{symbol}{expiration.replace('-','')}{opt_type}{int(strike*1000):08d}",
                     "underlying":    symbol,
                     "expiration":    expiration,
@@ -333,7 +334,14 @@ def _get_chain_yf(symbol: str, expiration: str, option_type: str = None) -> list
                     "theta":         greeks["theta"],
                     "vega":          greeks["vega"],
                     "iv":            iv,
-                })
+                    "greeks_source": "black_scholes",
+                }
+                # If real-time streaming is enabled (DXLINK_ENABLED), overlay
+                # genuine NBBO quotes and broker-calculated Greeks. Returns
+                # the contract untouched when streaming is off, disconnected,
+                # or stale — so the Black-Scholes values above always remain
+                # as the fallback rather than data going missing.
+                contracts.append(dxlink_stream.enrich_contract(contract))
 
         _parse(chain.calls, "C")
         _parse(chain.puts, "P")

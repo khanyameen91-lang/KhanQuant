@@ -426,6 +426,17 @@ def _scan_and_trade_inner():
     watchlist = market_data.get_watchlist()
     print(f"Scanning {watchlist}...")
 
+    # Keep the stream subscribed to near-the-money contracts on the
+    # watchlist's nearest expiration. Bounded by MAX_SUBSCRIPTIONS inside
+    # the client — an options chain has thousands of contracts and
+    # subscribing to all of them is how you exhaust a small box.
+    try:
+        import dxlink_stream
+        if dxlink_stream.is_enabled() and dxlink_stream.get_client().status()["connected"]:
+            _subscribe_atm_contracts(watchlist)
+    except Exception as e:
+        print(f"DXLink subscribe skipped: {e}")
+
     try:
         snapshots = market_data.get_market_snapshot()
         print(f"Found {len(snapshots)} option setups")
@@ -715,6 +726,47 @@ def end_of_day():
         print(f"ML retrain error: {e}")
 
 
+def _subscribe_atm_contracts(watchlist, strikes_per_side: int = 6):
+    """
+    Subscribe the DXLink stream to near-the-money contracts for each
+    watchlist symbol on its nearest expiration.
+
+    Only ATM-ish strikes matter: those are what the strategy builders
+    actually select (delta targets 0.20-0.45), and they're where accurate
+    Greeks change decisions. Subscribing whole chains would blow the
+    client's subscription cap on strikes the bot will never trade.
+    """
+    import dxlink_stream
+    client = dxlink_stream.get_client()
+    syms = []
+    for symbol in watchlist:
+        try:
+            resp = auth.session.get(f"/option-chains/{symbol}/nested")
+            items = resp.get("data", {}).get("items", [])
+            if not items:
+                continue
+            exps = items[0].get("expirations", [])
+            if not exps:
+                continue
+            quote = market_data.get_quote(symbol)
+            spot = quote["price"] if quote else 0
+            if not spot:
+                continue
+            strikes = sorted(exps[0].get("strikes", []),
+                             key=lambda s: abs(float(s.get("strike-price", 0)) - spot))
+            for s in strikes[:strikes_per_side]:
+                for key in ("call-streamer-symbol", "put-streamer-symbol"):
+                    if s.get(key):
+                        syms.append(s[key])
+        except Exception:
+            continue
+    if syms:
+        added = client.subscribe(syms)
+        if added:
+            print(f"DXLink: subscribed {added} new contracts "
+                  f"({client.status()['subscribed']}/{client.status()['max_subscriptions']})")
+
+
 def write_health_status():
     """
     Publish data-source health to logs/health_status.json for the
@@ -760,9 +812,29 @@ def write_health_status():
     except Exception as e:
         sources.append({"name": "News & macro intel", "detail": str(e)[:80], "status": "down"})
 
-    sources.append({"name": "Option chain & Greeks",
-                    "detail": "yfinance chain + Black-Scholes Greeks (not broker-supplied)",
-                    "status": "modeled"})
+    try:
+        import dxlink_stream
+        if not dxlink_stream.is_enabled():
+            sources.append({"name": "Option chain & Greeks",
+                            "detail": "yfinance chain + Black-Scholes Greeks "
+                                      "(DXLink streaming available but disabled)",
+                            "status": "modeled"})
+        else:
+            st = dxlink_stream.get_client().status()
+            if st["connected"]:
+                sources.append({"name": "Option chain & Greeks",
+                                "detail": f"DXLink real-time — {st['greeks_cached']} contracts "
+                                          f"with broker Greeks, rest Black-Scholes",
+                                "status": "live"})
+            else:
+                sources.append({"name": "Option chain & Greeks",
+                                "detail": f"DXLink enabled but disconnected "
+                                          f"({st['last_error'] or 'connecting'}) — "
+                                          f"falling back to Black-Scholes",
+                                "status": "degraded"})
+    except Exception as e:
+        sources.append({"name": "Option chain & Greeks",
+                        "detail": f"Black-Scholes ({str(e)[:40]})", "status": "modeled"})
     sources.append({"name": "Underlying quotes",
                     "detail": "Tastytrade NBBO (yfinance fallback if unavailable)",
                     "status": "live"})
@@ -922,6 +994,23 @@ def main():
     print(f"Max positions: {executor.MAX_OPEN_POSITIONS}")
     print(f"Scan interval: every {SCAN_INTERVAL_MINUTES} min")
     print(f"Market hours: {MARKET_OPEN.strftime('%H:%M')} — {MARKET_CLOSE.strftime('%H:%M')} ET")
+
+    # Real-time streaming (opt-in via DXLINK_ENABLED). Failing to connect
+    # is deliberately NOT fatal — market_data falls back to Black-Scholes
+    # Greeks, which is exactly how the bot ran before streaming existed.
+    try:
+        import dxlink_stream
+        if dxlink_stream.is_enabled():
+            print("DXLink streaming: connecting…")
+            if dxlink_stream.get_client().start():
+                print("DXLink streaming: connected (real broker Greeks active)")
+            else:
+                print(f"DXLink streaming: unavailable "
+                      f"({dxlink_stream.get_client().last_error}) — using Black-Scholes")
+        else:
+            print("DXLink streaming: disabled (set DXLINK_ENABLED=true to enable)")
+    except Exception as e:
+        print(f"DXLink streaming: init error {e} — using Black-Scholes")
 
     alerts.bot_started()
     setup_schedule()
